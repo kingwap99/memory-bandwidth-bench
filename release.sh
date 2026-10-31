@@ -6,6 +6,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 BUMP=${1:-patch}
+
+# Refuse to fold unrelated edits into the Release commit.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "working tree has uncommitted changes; commit or stash them first"
+  git status --short
+  exit 1
+fi
 PB=/usr/libexec/PlistBuddy
 PLIST=Info.plist
 

@@ -15,7 +15,8 @@ cp -f Info.plist "$APP/Contents/Info.plist"
 [ -f AppIcon.icns ] && cp -f AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> Ad-hoc signing"
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+xattr -cr "$APP"
+codesign --force --sign - "$APP"
 
 echo "==> Done: $(pwd)/$APP"
 echo "    Run it with: open \"$APP\""

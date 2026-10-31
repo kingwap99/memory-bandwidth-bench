@@ -310,7 +310,7 @@ final class Runner: ObservableObject {
         running = true
         results = []
         errorMessage = nil
-        progressTotal = max(1, modes.count * iterations)
+        progressTotal = max(1, modes.reduce(0) { $0 + ($1 == .cpuGpu ? iterations * 8 : iterations) })
         progressDone = 0
         statusText = L.t("配置記憶體…", "Allocating memory…")
         lastRun = RunSnapshot(sizeMB: sizeMB, threads: threads, iterations: iterations, startedAt: Date())
@@ -396,7 +396,7 @@ final class Runner: ObservableObject {
             DispatchQueue.main.async {
                 self.errorMessage = L.t("Metal 初始化或 GPU 緩衝區配置失敗，已跳過 CPU+GPU 併發測試。",
                                   "Metal initialization or GPU buffer allocation failed; the CPU+GPU concurrent test was skipped.")
-                self.progressDone += iterations
+                self.progressDone += iterations * 8
             }
             return
         }
@@ -413,7 +413,7 @@ final class Runner: ObservableObject {
             let r = measureCPUGPU(src: src, words: words, threads: threads)
             totals.append(r.total); cpuPart.append(r.cpu); gpuPart.append(r.gpu)
             msList.append(r.secs * 1000)
-            DispatchQueue.main.async { self.progressDone += 1 }
+            DispatchQueue.main.async { self.progressDone += 8 }
         }
         guard !totals.isEmpty else { return }
         let avg = totals.reduce(0, +) / Double(totals.count)
@@ -473,6 +473,7 @@ final class Runner: ObservableObject {
             DispatchQueue.concurrentPerform(iterations: threads) { i in
                 let start = i * chunk
                 let end = (i == threads - 1) ? words : min(start + chunk, words)
+                guard end > start else { return }
                 sums[i] = readRun(src + start, end - start)
             }
             blackHole(sums.reduce(0, &+))
@@ -480,6 +481,7 @@ final class Runner: ObservableObject {
             DispatchQueue.concurrentPerform(iterations: threads) { i in
                 let start = i * chunk
                 let end = (i == threads - 1) ? words : min(start + chunk, words)
+                guard end > start else { return }
                 writeRun(dst + start, end - start)
             }
             blackHole(dst[0])
@@ -488,6 +490,7 @@ final class Runner: ObservableObject {
             DispatchQueue.concurrentPerform(iterations: threads) { i in
                 let start = i * chunk
                 let end = (i == threads - 1) ? words : min(start + chunk, words)
+                guard end > start else { return }
                 writeRun(target + start, end - start)
             }
             blackHole(target[0])
@@ -495,6 +498,7 @@ final class Runner: ObservableObject {
             DispatchQueue.concurrentPerform(iterations: threads) { i in
                 let start = i * chunk
                 let end = (i == threads - 1) ? words : min(start + chunk, words)
+                guard end > start else { return }
                 memcpy(dst + start, src + start, (end - start) * MemoryLayout<UInt64>.size)
             }
             blackHole(dst[0])
@@ -635,6 +639,35 @@ final class Runner: ObservableObject {
         blackHole((0..<threads).reduce(UInt64(0)) { $0 &+ sinkOut[$1] })
         let gpuGBps = gpuBytes / win / 1e9
         return (cpuGBps + gpuGBps, cpuGBps, gpuGBps, win)
+    }
+}
+extension Runner {
+    /// --self-test fast path: one small pass per mode, JSON to stdout (for CI).
+    func selfTest(sizeMB: Int = 16, threads: Int = 2) -> [String] {
+        let bytes = sizeMB * 1024 * 1024
+        var rawSrc: UnsafeMutableRawPointer?
+        var rawDst: UnsafeMutableRawPointer?
+        guard posix_memalign(&rawSrc, 4096, bytes) == 0,
+              posix_memalign(&rawDst, 4096, bytes) == 0,
+              let srcRaw = rawSrc, let dstRaw = rawDst else { return [] }
+        defer { free(srcRaw); free(dstRaw) }
+        memset(srcRaw, 0xAB, bytes)
+        memset(dstRaw, 0xCD, bytes)
+        let src = srcRaw.assumingMemoryBound(to: UInt64.self)
+        let dst = dstRaw.assumingMemoryBound(to: UInt64.self)
+        let words = bytes / MemoryLayout<UInt64>.size
+        var lines: [String] = []
+        for mode in [TestMode.read, .write, .writePingPong, .copy] {
+            let secs = Runner.measure(mode: mode, src: src, dst: dst, words: words,
+                                      threads: threads, alt: false)
+            let moved = mode == .copy ? Double(bytes) * 2 : Double(bytes)
+            lines.append("{\"mode\":\"\(mode.rawValue)\",\"gbps\":\(String(format: "%.2f", moved / max(secs, 1e-9) / 1e9)),\"ms\":\(String(format: "%.2f", secs * 1000))}")
+        }
+        if setupGPUBuffers(bytes: bytes) {
+            let r = measureCPUGPU(src: src, words: words, threads: threads)
+            lines.append("{\"mode\":\"cpu+gpu\",\"gbps\":\(String(format: "%.2f", r.total))}")
+        }
+        return lines
     }
 }
 
@@ -813,7 +846,7 @@ struct ContentView: View {
                     TableColumn(L.t("平均 GB/s", "Avg GB/s")) { Text(String(format: "%.1f", $0.avgGBps)).monospacedDigit() }
                     TableColumn(L.t("峰值 GB/s", "Peak GB/s")) { Text(String(format: "%.1f", $0.peakGBps)).monospacedDigit() }
                     TableColumn(L.t("達原廠 %", "% of Official")) { r in
-                        if let spec = currentChipSpec {
+                        if let spec = currentChipSpec, spec.baselineGBps > 0 {
                             Text(String(format: "%.0f%%", r.avgGBps / spec.baselineGBps * 100)).monospacedDigit()
                                 .foregroundStyle(r.avgGBps / spec.baselineGBps >= 0.75 ? .green : .secondary)
                         } else {
@@ -847,7 +880,7 @@ struct ContentView: View {
                 let c = r.cpuGBps.map { String(format: "%.2f", $0) } ?? ""
                 let g = r.gpuGBps.map { String(format: "%.2f", $0) } ?? ""
                 let o = official.map { String(format: "%.0f", $0) } ?? ""
-                let pct = official.map { String(format: "%.1f", r.avgGBps / $0 * 100) } ?? ""
+                let pct = official.flatMap { $0 > 0 ? String(format: "%.1f", r.avgGBps / $0 * 100) : nil } ?? ""
                 csv += "\(iso),\(run.sizeMB),\(run.threads),\(run.iterations),\(r.mode.rawValue),\(String(format: "%.2f", r.avgGBps)),\(String(format: "%.2f", r.peakGBps)),\(String(format: "%.2f", r.avgMs)),\(c),\(g),\(o),\(pct)\n"
             }
             try? csv.write(to: url, atomically: true, encoding: .utf8)
@@ -857,6 +890,15 @@ struct ContentView: View {
 
 @main
 struct MemoryBandwidthBenchApp: App {
+    init() {
+        if CommandLine.arguments.contains("--self-test") {
+            let lines = Runner().selfTest()
+            let text = "[" + lines.joined(separator: ",") + "]\n"
+            FileHandle.standardOutput.write(text.data(using: .utf8)!)
+            exit(lines.isEmpty ? 1 : 0)
+        }
+    }
+
     var body: some Scene {
         WindowGroup(L.t("記憶體頻寬測試", "Memory Bandwidth Bench") + " v\(appVersion)") {
             ContentView()

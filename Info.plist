@@ -26,9 +26,13 @@
 	<string>1.0.5</string>
 	<key>CFBundleVersion</key>
 	<string>9</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 kingwap99. MIT License.</string>
 </dict>
 </plist>

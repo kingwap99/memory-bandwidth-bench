@@ -1,4 +1,4 @@
-<p align="center"><img src="icons/icon-C.png" alt="Memory Bandwidth Bench icon" width="128" height="128"></p>
+<p align="center"><img src="icons/logo.png" alt="Memory Bandwidth Bench icon" width="128" height="128"></p>
 
 <h1 align="center">Memory Bandwidth Bench</h1>
 
@@ -11,7 +11,7 @@ A macOS GUI app that measures real memory bandwidth and compares it against Appl
     ./build.sh
     open MemoryBandwidthBench.app
 
-`build.sh` compiles `main.swift`, refreshes the `.app` bundle, and ad-hoc signs it. Requires Xcode Command Line Tools.
+`build.sh` compiles `main.swift`, refreshes the `.app` bundle, and ad-hoc signs it. Requires macOS 13+ and Xcode Command Line Tools.
 
 ## Release
 
@@ -44,6 +44,10 @@ The git tag is the single source of truth. One command bumps the version, rebuil
 - CPU-only reads are bound by Little's Law (outstanding requests x 64 B / latency) and typically reach ~50% of theoretical peak; CPU+GPU concurrent reaches ~75-80%. The 200 GB/s figure for M1 Pro is the LPDDR bus theoretical peak.
 - "Peak" is the best of the timed iterations; each iteration auto-repeats to fill a 20 ms timing window and reduce scheduling jitter.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Language / 語系
 
 The UI detects the system language at launch: Traditional Chinese (zh-Hant), Simplified Chinese (zh-Hans, converted automatically via CoreText), or English. The app title always carries the version suffix (e.g. "Memory Bandwidth Bench v1.0.5").
@@ -59,7 +63,7 @@ The UI detects the system language at launch: Traditional Chinese (zh-Hant), Sim
     ./build.sh
     open MemoryBandwidthBench.app
 
-`build.sh` 會編譯 `main.swift`、更新 `.app` bundle 並做 ad-hoc 簽章。需要 Xcode Command Line Tools。
+`build.sh` 會編譯 `main.swift`、更新 `.app` bundle 並做 ad-hoc 簽章。需要 macOS 13+ 與 Xcode Command Line Tools。
 
 ### 發布新版本
 
@@ -92,6 +96,10 @@ The UI detects the system language at launch: Traditional Chinese (zh-Hant), Sim
 - CPU 端讀取受 Little's Law 限制，通常約為理論峰值 5 成；CPU＋GPU 併發約 75–80%。
 - 「峰值」是各次迭代中最好的一次；每次迭代自動重複以湊滿 20 ms 計時窗、壓低排程誤差。
 
+### 授權
+
+MIT，詳見 [LICENSE](LICENSE)。
+
 ### 簽章提醒
 
 Ad-hoc 簽章、未經 Apple 公證。本機使用請在首次開啟時對 app 按兩下選「打開」；經瀏覽器或郵件下載分發給他人時可能被 Gatekeeper 阻擋。
@@ -99,6 +107,7 @@ Ad-hoc 簽章、未經 Apple 公證。本機使用請在首次開啟時對 app �
 ## Files
 
 - `main.swift` — all source (UI + measurement core + Metal kernel)
+- `LICENSE` — MIT
 - `build.sh` — build script
 - `make_dmg.sh` — package the DMG (drag-to-install)
 - `release.sh` — version bump + build + DMG + tag + GitHub Release

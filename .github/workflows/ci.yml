@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-selftest:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: swiftc -O -parse-as-library main.swift -o MemoryBandwidthBench
+      - name: Self-test (all modes, headless)
+        run: ./MemoryBandwidthBench --self-test | python3 -m json.tool
