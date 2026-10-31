@@ -40,6 +40,7 @@ DMG="MemoryBandwidthBench-$NEW.dmg"
 
 git add -A
 git -c user.name="${GIT_AUTHOR_NAME:-kingwap99}" -c user.email="${GIT_AUTHOR_EMAIL:-kingwap99@users.noreply.github.com}" commit -m "Release $TAG" || true
+git tag "$TAG"
 git push origin main "refs/tags/$TAG"
 
 gh release create "$TAG" "$DMG" --title "Memory Bandwidth Bench $TAG" --notes "macOS memory bandwidth benchmark. Auto UI language (zh-Hant/zh-Hans/en), official-spec baseline with % of official, GPU-core-count config detection. Ad-hoc signed: right-click > Open on first launch." || gh release upload "$TAG" "$DMG" --clobber
