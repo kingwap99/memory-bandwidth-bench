@@ -41,8 +41,8 @@ DMG="MemoryBandwidthBench-$NEW.dmg"
 git add -A
 git -c user.name="${GIT_AUTHOR_NAME:-kingwap99}" -c user.email="${GIT_AUTHOR_EMAIL:-kingwap99@users.noreply.github.com}" commit -m "Release $TAG" || true
 git tag "$TAG"
-git push origin main --follow-tags
+git push origin main "refs/tags/$TAG"
 
-gh release create "$TAG" "$DMG" --title "Memory Bandwidth Bench $TAG" --notes "macOS 記憶體頻寬測試 App。自動偵測語系（繁中/简中/英文）、原廠規格基準線與達原廠%。ad-hoc 簽章，首次開啟請按兩下選打開。" 2>/dev/null || gh release upload "$TAG" "$DMG" --clobber
+gh release create "$TAG" "$DMG" --title "Memory Bandwidth Bench $TAG" --notes "macOS 記憶體頻寬測試 App。自動偵測語系（繁中/简中/英文）、原廠規格基準線與達原廠%。ad-hoc 簽章，首次開啟請按兩下選打開。" || gh release upload "$TAG" "$DMG" --clobber
 
 echo "==> 發布完成：$TAG（build $BUILD）"
