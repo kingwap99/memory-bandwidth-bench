@@ -23,7 +23,7 @@ build.sh 會編譯 main.swift、更新 .app bundle 並做 ad-hoc 簽章。需要
 
 - App 依 `machdep.cpu.brand_string` 自動匹配內建的晶片規格表（M1～M5 全系，數字取自 Apple 官方技術規格頁），
   在標題列顯示原廠記憶體頻寬，圖表畫橘色虛線基準，結果表格多一欄「達原廠 %」，CSV 匯出附 `official_GBps` 與 `pct_of_official`。
-- 同家族不同配置頻寬不同（例如 M5 Max 460／614 GB/s 依 GPU 配置），基準線取標準版；實際以 Apple 官網規格頁為準。
+- 同家族不同配置頻寬不同（例如 M5 Max：32 核 GPU＝460 GB/s、40 核 GPU＝614 GB/s）。App 會從 IORegistry 讀取 gpu-core-count 自動判定該機配置並顯示對應數字；讀不到時退回顯示兩個數字。M5 依記憶體容量判定（16GB＝153、24／32GB＝170）。
 
 ## 量測注意事項
 
