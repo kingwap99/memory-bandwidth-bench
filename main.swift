@@ -2,6 +2,7 @@ import SwiftUI
 import Charts
 import AppKit
 import Metal
+import IOKit
 
 // MARK: - 系統資訊
 
@@ -32,6 +33,26 @@ let machineRAMBytes = sysctlUInt64("hw.memsize") ?? 0
 let logicalCores = max(1, sysctlInt32("hw.ncpu") ?? ProcessInfo.processInfo.activeProcessorCount)
 let performanceCores = sysctlInt32("hw.perflevel0.physicalcpu") ?? 0
 let efficiencyCores = sysctlInt32("hw.perflevel1.physicalcpu") ?? 0
+
+/// 從 IORegistry 讀 GPU 核心數（多配置晶片用它判定官方頻寬）；讀不到回傳 0
+let gpuCoreCount: Int = {
+    var iter = io_iterator_t()
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iter) == KERN_SUCCESS else { return 0 }
+    defer { IOObjectRelease(iter) }
+    var cores = 0
+    while true {
+        let svc = IOIteratorNext(iter)
+        if svc == 0 { break }
+        var props: Unmanaged<CFMutableDictionary>?
+        if IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+           let dict = props?.takeRetainedValue() as? [String: Any],
+           let n = dict["gpu-core-count"] as? Int {
+            cores = max(cores, n)
+        }
+        IOObjectRelease(svc)
+    }
+    return cores
+}()
 
 // MARK: - 語系自動偵測（繁中／简中／英文）
 
@@ -85,37 +106,66 @@ func formatGB(_ bytes: UInt64) -> String {
 // MARK: - Apple 官方記憶體頻寬規格（參考用）
 
 struct ChipSpec: Identifiable {
-    let label: String        // 晶片家族
-    let officialText: String // Apple 官網標示的記憶體頻寬
-    let baselineGBps: Double // 畫基準線用；多配置家族取標準版
-    var multiConfig: Bool = false // 同家族依配置有不同官方頻寬
+    let label: String                    // 晶片家族
+    let lowText: String                  // 標準版官方頻寬（如 "460"）
+    var highText: String? = nil          // 高配版官方頻寬（如 "614"）
+    var gpuHighThreshold: Int? = nil     // GPU 核心數 ≥ 此值 → 高配頻寬
+    var ramHighThresholdGB: Int? = nil   // RAM ≥ 此值 → 高配頻寬
     var id: String { label }
+
+    /// nil＝讀不到判定依據（退回顯示兩個數字）
+    private var isHigh: Bool? {
+        guard highText != nil else { return false }
+        if let t = gpuHighThreshold {
+            guard gpuCoreCount > 0 else { return nil }
+            return gpuCoreCount >= t
+        }
+        if let t = ramHighThresholdGB {
+            return Int(machineRAMBytes / 1_073_741_824) >= t
+        }
+        return false
+    }
+
     var officialDisplay: String {
         let sep = L.lang == .en ? "/" : "\u{FF0F}"
-        let base = officialText.replacingOccurrences(of: "\u{FF0F}", with: sep) + " GB/s"
-        return multiConfig ? base + " " + L.specNoteGPU : base
+        guard let high = highText else { return lowText + " GB/s" }
+        switch isHigh {
+        case .some(true):
+            let note = gpuHighThreshold != nil
+                ? L.t("（\(gpuCoreCount) 核 GPU）", "(\(gpuCoreCount)-core GPU)")
+                : L.t("（依記憶體容量）", "(by RAM capacity)")
+            return high + " GB/s " + note
+        case .some(false):
+            return lowText + " GB/s"
+        case nil:
+            return lowText + sep + high + " GB/s " + L.specNoteGPU
+        }
+    }
+
+    var baselineGBps: Double {
+        (isHigh ?? false) ? (Double(highText ?? "") ?? 0) : (Double(lowText) ?? 0)
     }
 }
 
 /// 數字取自 Apple 官方技術規格頁（tech specs）；同家族不同配置頻寬不同，實際以官網為準。
 let appleChipSpecs: [ChipSpec] = [
-    ChipSpec(label: "M1", officialText: "68.25", baselineGBps: 68),
-    ChipSpec(label: "M1 Pro", officialText: "200", baselineGBps: 200),
-    ChipSpec(label: "M1 Max", officialText: "400", baselineGBps: 400),
-    ChipSpec(label: "M1 Ultra", officialText: "800", baselineGBps: 800),
-    ChipSpec(label: "M2", officialText: "100", baselineGBps: 100),
-    ChipSpec(label: "M2 Pro", officialText: "200", baselineGBps: 200),
-    ChipSpec(label: "M2 Max", officialText: "400", baselineGBps: 400),
-    ChipSpec(label: "M2 Ultra", officialText: "800", baselineGBps: 800),
-    ChipSpec(label: "M3", officialText: "100", baselineGBps: 100),
-    ChipSpec(label: "M3 Pro", officialText: "150", baselineGBps: 150),
-    ChipSpec(label: "M3 Max", officialText: "300／400", baselineGBps: 300, multiConfig: true),
-    ChipSpec(label: "M4", officialText: "120", baselineGBps: 120),
-    ChipSpec(label: "M4 Pro", officialText: "273", baselineGBps: 273),
-    ChipSpec(label: "M4 Max", officialText: "410／546", baselineGBps: 410, multiConfig: true),
-    ChipSpec(label: "M5", officialText: "153／170", baselineGBps: 153, multiConfig: true),
-    ChipSpec(label: "M5 Pro", officialText: "307", baselineGBps: 307),
-    ChipSpec(label: "M5 Max", officialText: "460／614", baselineGBps: 460, multiConfig: true),
+    ChipSpec(label: "M1", lowText: "68.25"),
+    ChipSpec(label: "M1 Pro", lowText: "200"),
+    ChipSpec(label: "M1 Max", lowText: "400"),
+    ChipSpec(label: "M1 Ultra", lowText: "800"),
+    ChipSpec(label: "M2", lowText: "100"),
+    ChipSpec(label: "M2 Pro", lowText: "200"),
+    ChipSpec(label: "M2 Max", lowText: "400"),
+    ChipSpec(label: "M2 Ultra", lowText: "800"),
+    ChipSpec(label: "M3", lowText: "100"),
+    ChipSpec(label: "M3 Pro", lowText: "150"),
+    ChipSpec(label: "M3 Max", lowText: "300", highText: "400", gpuHighThreshold: 40),
+    ChipSpec(label: "M4", lowText: "120"),
+    ChipSpec(label: "M4 Pro", lowText: "273"),
+    ChipSpec(label: "M4 Max", lowText: "410", highText: "546", gpuHighThreshold: 40),
+    ChipSpec(label: "M5", lowText: "153", highText: "170", ramHighThresholdGB: 24),
+    ChipSpec(label: "M5 Pro", lowText: "307"),
+    ChipSpec(label: "M5 Max", lowText: "460", highText: "614", gpuHighThreshold: 40),
 ]
 
 /// 依 brand_string 匹配晶片家族；先比對較長的 label，避免「M5 Max」被「M5」搶先媒合。
