@@ -1,0 +1,755 @@
+import SwiftUI
+import Charts
+import AppKit
+import Metal
+
+// MARK: - 系統資訊
+
+func sysctlString(_ name: String) -> String {
+    var size = 0
+    guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "unknown" }
+    var buf = [CChar](repeating: 0, count: size)
+    guard sysctlbyname(name, &buf, &size, nil, 0) == 0 else { return "unknown" }
+    return String(cString: buf)
+}
+
+func sysctlInt32(_ name: String) -> Int? {
+    var v: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    guard sysctlbyname(name, &v, &size, nil, 0) == 0 else { return nil }
+    return Int(v)
+}
+
+func sysctlUInt64(_ name: String) -> UInt64? {
+    var v: UInt64 = 0
+    var size = MemoryLayout<UInt64>.size
+    guard sysctlbyname(name, &v, &size, nil, 0) == 0 else { return nil }
+    return v
+}
+
+let machineChip = sysctlString("machdep.cpu.brand_string")
+let machineRAMBytes = sysctlUInt64("hw.memsize") ?? 0
+let logicalCores = max(1, sysctlInt32("hw.ncpu") ?? ProcessInfo.processInfo.activeProcessorCount)
+let performanceCores = sysctlInt32("hw.perflevel0.physicalcpu") ?? 0
+let efficiencyCores = sysctlInt32("hw.perflevel1.physicalcpu") ?? 0
+
+var coreSummary: String {
+    if performanceCores > 0, efficiencyCores > 0 {
+        return "\(performanceCores)P+\(efficiencyCores)E・\(logicalCores) 執行緒"
+    }
+    return "\(logicalCores) 執行緒"
+}
+
+func formatGB(_ bytes: UInt64) -> String {
+    // 用二進位單位：17179869184 bytes = 16 GiB（Apple 標示的 16 GB）
+    let gb = Double(bytes) / 1_073_741_824
+    if gb >= 1 { return String(format: "%.0f GB", gb) }
+    return String(format: "%.0f MB", Double(bytes) / 1_048_576)
+}
+
+
+// MARK: - Apple 官方記憶體頻寬規格（參考用）
+
+struct ChipSpec: Identifiable {
+    let label: String        // 晶片家族
+    let officialText: String // Apple 官網標示的記憶體頻寬
+    let baselineGBps: Double // 畫基準線用；多配置家族取標準版
+    var id: String { label }
+}
+
+/// 數字取自 Apple 官方技術規格頁（tech specs）；同家族不同配置頻寬不同，實際以官網為準。
+let appleChipSpecs: [ChipSpec] = [
+    ChipSpec(label: "M1", officialText: "68.25 GB/s", baselineGBps: 68),
+    ChipSpec(label: "M1 Pro", officialText: "200 GB/s", baselineGBps: 200),
+    ChipSpec(label: "M1 Max", officialText: "400 GB/s", baselineGBps: 400),
+    ChipSpec(label: "M1 Ultra", officialText: "800 GB/s", baselineGBps: 800),
+    ChipSpec(label: "M2", officialText: "100 GB/s", baselineGBps: 100),
+    ChipSpec(label: "M2 Pro", officialText: "200 GB/s", baselineGBps: 200),
+    ChipSpec(label: "M2 Max", officialText: "400 GB/s", baselineGBps: 400),
+    ChipSpec(label: "M2 Ultra", officialText: "800 GB/s", baselineGBps: 800),
+    ChipSpec(label: "M3", officialText: "100 GB/s", baselineGBps: 100),
+    ChipSpec(label: "M3 Pro", officialText: "150 GB/s", baselineGBps: 150),
+    ChipSpec(label: "M3 Max", officialText: "300／400 GB/s（依 GPU 配置）", baselineGBps: 300),
+    ChipSpec(label: "M4", officialText: "120 GB/s", baselineGBps: 120),
+    ChipSpec(label: "M4 Pro", officialText: "273 GB/s", baselineGBps: 273),
+    ChipSpec(label: "M4 Max", officialText: "410／546 GB/s（依 GPU 配置）", baselineGBps: 410),
+    ChipSpec(label: "M5", officialText: "153／170 GB/s（依配置）", baselineGBps: 153),
+    ChipSpec(label: "M5 Pro", officialText: "307 GB/s", baselineGBps: 307),
+    ChipSpec(label: "M5 Max", officialText: "460／614 GB/s（依 GPU 配置）", baselineGBps: 460),
+]
+
+/// 依 brand_string 匹配晶片家族；先比對較長的 label，避免「M5 Max」被「M5」搶先媒合。
+let currentChipSpec: ChipSpec? = {
+    let chip = machineChip
+    return appleChipSpecs
+        .sorted { $0.label.count > $1.label.count }
+        .first { chip.localizedCaseInsensitiveContains($0.label) }
+}()
+// MARK: - 單調時鐘與防最佳化
+
+@inline(__always) func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+@inline(__always) func nsToSec(_ ns: UInt64) -> Double { Double(ns) / 1_000_000_000 }
+
+/// 只在單執行緒路徑使用；多執行緒請各自寫入自己的緩衝區
+var globalSink: UInt64 = 0
+@inline(never) func blackHole(_ x: UInt64) { globalSink = x }
+
+final class StopFlag {
+    private let lock = NSLock()
+    private var flag = false
+    var value: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return flag
+    }
+    func set() {
+        lock.lock(); flag = true; lock.unlock()
+    }
+}
+
+// MARK: - 測試模型
+
+enum TestMode: String, CaseIterable, Identifiable {
+    case read = "讀取"
+    case write = "寫入"
+    case writePingPong = "寫入(乒乓)"
+    case copy = "複製"
+    case cpuGpu = "CPU+GPU併發"
+    var id: String { rawValue }
+
+    var detail: String {
+        switch self {
+        case .read:  return "每個執行緒依序讀取自己那片記憶體（8 路展開 uint64 累加，提高在途請求數）"
+        case .write: return "每個執行緒填滿自己那片記憶體（8 路展開寫入）"
+        case .writePingPong: return "每次迭代交替寫入兩塊 buffer，強迫上一輪的髒資料在本輪逐出，更貼近真實 DRAM 寫入頻寬"
+        case .copy:  return "memcpy：src → dst，流量計入讀＋寫雙向位元組"
+        case .cpuGpu: return "CPU 全部執行緒持續掃描＋GPU Metal kernel 同時讀取，合計最接近整機 DRAM 實際上限"
+        }
+    }
+}
+
+struct BenchResult: Identifiable {
+    let id = UUID()
+    let mode: TestMode
+    let avgGBps: Double
+    let peakGBps: Double
+    let avgMs: Double
+    var cpuGBps: Double? = nil   // 僅 CPU+GPU 併發模式有意義
+    var gpuGBps: Double? = nil
+}
+
+// MARK: - 測試引擎
+
+final class Runner: ObservableObject {
+    struct RunSnapshot {
+        let sizeMB: Int
+        let threads: Int
+        let iterations: Int
+        let startedAt: Date
+    }
+
+    @Published var running = false
+    @Published var results: [BenchResult] = []
+    @Published var progressDone = 0
+    @Published var progressTotal = 1
+    @Published var statusText = "尚未測試"
+    @Published var errorMessage: String?
+    @Published private(set) var lastRun: RunSnapshot?
+
+    private let stateLock = NSLock()
+    private var cancelRequested = false
+
+    // MARK: Metal（第一次用到 CPU+GPU 模式時才初始化）
+    private let mtlDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
+    private var mtlQueue: MTLCommandQueue?
+    private var gpuPso: MTLComputePipelineState?
+    private var gpuBuf: MTLBuffer?
+    private var gpuOutBuf: MTLBuffer?
+    private let gpuThreads = 32768
+    private var activityToken: NSObjectProtocol?
+
+    static let gpuKernelSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void bw_read(device const float4* buf [[buffer(0)]],
+                        device float4* out [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        uint tid [[thread_position_in_grid]],
+                        uint total [[threads_per_grid]]) {
+        float4 acc = float4(0.0);
+        for (uint i = tid; i < count; i += total) { acc += buf[i]; }
+        out[tid] = acc;
+    }
+    """
+
+    var isCancelled: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return cancelRequested
+    }
+
+    func cancel() {
+        stateLock.lock()
+        cancelRequested = true
+        stateLock.unlock()
+        statusText = "正在停止…"
+    }
+
+    // MARK: 執行流程
+
+    func run(sizeMB: Int, threads: Int, iterations: Int, modes: [TestMode]) {
+        guard !running else { return }
+        stateLock.lock(); cancelRequested = false; stateLock.unlock()
+
+        running = true
+        results = []
+        errorMessage = nil
+        progressTotal = max(1, modes.count * iterations)
+        progressDone = 0
+        statusText = "配置記憶體…"
+        lastRun = RunSnapshot(sizeMB: sizeMB, threads: threads, iterations: iterations, startedAt: Date())
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
+            reason: "Memory bandwidth benchmark running")
+
+        // userInteractive：避免測試執行緒被排到效率核而壓低讀取頻寬
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { return }
+            defer { self.finishRun() }
+
+            let bytes = sizeMB * 1024 * 1024
+            var rawSrc: UnsafeMutableRawPointer?
+            var rawDst: UnsafeMutableRawPointer?
+            let r1 = posix_memalign(&rawSrc, 4096, bytes)
+            let r2 = posix_memalign(&rawDst, 4096, bytes)
+            guard r1 == 0, r2 == 0, let srcRaw = rawSrc, let dstRaw = rawDst else {
+                if let p = rawSrc { free(p) }
+                if let p = rawDst { free(p) }
+                DispatchQueue.main.async {
+                    self.errorMessage = "無法配置 \(sizeMB) MB ×2 的測試緩衝區，請選擇較小的尺寸。"
+                }
+                return
+            }
+            defer { free(srcRaw); free(dstRaw) }
+
+            // 首次觸碰（first-touch）讓分頁實際配置，不計入計時
+            DispatchQueue.main.async { self.statusText = "暖機中…" }
+            memset(srcRaw, 0xAB, bytes)
+            memset(dstRaw, 0xCD, bytes)
+
+            let src = srcRaw.assumingMemoryBound(to: UInt64.self)
+            let dst = dstRaw.assumingMemoryBound(to: UInt64.self)
+            let words = bytes / MemoryLayout<UInt64>.size
+
+            for mode in modes where mode != .cpuGpu {
+                if self.isCancelled { break }
+                self.runCPUMode(mode: mode, src: src, dst: dst, bytes: bytes,
+                                words: words, threads: threads, iterations: iterations)
+            }
+
+            if modes.contains(.cpuGpu), !self.isCancelled {
+                self.runCPUPlusGPU(src: src, words: words, bytes: bytes,
+                                   threads: threads, iterations: iterations)
+            }
+        }
+    }
+
+    private func runCPUMode(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
+                            dst: UnsafeMutablePointer<UInt64>, bytes: Int, words: Int,
+                            threads: Int, iterations: Int) {
+        // 暖身一次（不計入）：讓 CPU 升頻、TLB/分頁穩定。
+        // 乒乓模式暖身寫 src，讓第 1 次正式迭代（寫 dst）就開始交替。
+        _ = Runner.measure(mode: mode, src: src, dst: dst, words: words, threads: threads, alt: true)
+
+        var gbps: [Double] = []
+        var msList: [Double] = []
+        for it in 1...iterations {
+            if isCancelled { break }
+            let index = it
+            DispatchQueue.main.async { self.statusText = "\(mode.rawValue) 第 \(index)/\(iterations) 次…" }
+            let secs = Runner.measure(mode: mode, src: src, dst: dst, words: words,
+                                      threads: threads, alt: it % 2 == 0)
+            let moved = mode == .copy ? Double(bytes) * 2 : Double(bytes)
+            gbps.append(moved / secs / 1_000_000_000)
+            msList.append(secs * 1000)
+            DispatchQueue.main.async { self.progressDone += 1 }
+        }
+        guard !gbps.isEmpty else { return }
+        let avg = gbps.reduce(0, +) / Double(gbps.count)
+        let peak = gbps.max() ?? 0
+        let avgMs = msList.reduce(0, +) / Double(msList.count)
+        DispatchQueue.main.async {
+            self.results.append(BenchResult(mode: mode, avgGBps: avg, peakGBps: peak, avgMs: avgMs))
+        }
+    }
+
+    private func runCPUPlusGPU(src: UnsafeMutablePointer<UInt64>, words: Int, bytes: Int,
+                               threads: Int, iterations: Int) {
+        guard setupGPUBuffers(bytes: bytes) else {
+            DispatchQueue.main.async {
+                self.errorMessage = "Metal 初始化或 GPU 緩衝區配置失敗，已跳過 CPU+GPU 併發測試。"
+                self.progressDone += iterations
+            }
+            return
+        }
+        _ = measureCPUGPU(src: src, words: words, threads: threads)   // 暖身
+
+        var totals: [Double] = []
+        var cpuPart: [Double] = []
+        var gpuPart: [Double] = []
+        var msList: [Double] = []
+        for it in 1...iterations {
+            if isCancelled { break }
+            let index = it
+            DispatchQueue.main.async { self.statusText = "CPU+GPU 併發 第 \(index)/\(iterations) 次…" }
+            let r = measureCPUGPU(src: src, words: words, threads: threads)
+            totals.append(r.total); cpuPart.append(r.cpu); gpuPart.append(r.gpu)
+            msList.append(r.secs * 1000)
+            DispatchQueue.main.async { self.progressDone += 1 }
+        }
+        guard !totals.isEmpty else { return }
+        let avg = totals.reduce(0, +) / Double(totals.count)
+        let peak = totals.max() ?? 0
+        let avgMs = msList.reduce(0, +) / Double(msList.count)
+        let cAvg = cpuPart.reduce(0, +) / Double(cpuPart.count)
+        let gAvg = gpuPart.reduce(0, +) / Double(gpuPart.count)
+        DispatchQueue.main.async {
+            self.results.append(BenchResult(mode: .cpuGpu, avgGBps: avg, peakGBps: peak,
+                                            avgMs: avgMs, cpuGBps: cAvg, gpuGBps: gAvg))
+        }
+    }
+
+    /// 統一的收尾：確保電源斷言一定會釋放（含配置失敗、取消等所有路徑）
+    private func finishRun() {
+        let cancelled = isCancelled
+        DispatchQueue.main.async {
+            if let token = self.activityToken {
+                ProcessInfo.processInfo.endActivity(token)
+                self.activityToken = nil
+            }
+            self.running = false
+            self.statusText = cancelled ? "已停止" : "完成"
+        }
+    }
+
+    // MARK: 量測
+
+    /// 回傳秒數。短於 20 ms 的測試會自動重複多輪，壓低執行緒喚醒造成的誤差。
+    static func measure(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
+                        dst: UnsafeMutablePointer<UInt64>, words: Int, threads: Int,
+                        alt: Bool) -> Double {
+        let first = measureOnce(mode: mode, src: src, dst: dst, words: words,
+                                threads: threads, alt: alt)
+        let minWindow = 0.02
+        guard first < minWindow else { return first }
+        let reps = min(64, max(2, Int(minWindow / max(first, 1e-6)) + 1))
+        let t0 = nowNs()
+        for _ in 0..<reps {
+            _ = measureOnce(mode: mode, src: src, dst: dst, words: words,
+                            threads: threads, alt: alt)
+        }
+        // 回傳「單趟平均」，呼叫端才不會把重複次數算成額外搬運量
+        return nsToSec(nowNs() - t0) / Double(reps)
+    }
+
+    private static func measureOnce(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
+                                    dst: UnsafeMutablePointer<UInt64>, words: Int,
+                                    threads: Int, alt: Bool) -> Double {
+        let chunk = max(64, (words / threads) & ~63)   // 對齊 512 bytes
+        let t0 = nowNs()
+        switch mode {
+        case .cpuGpu:
+            return 0   // 併發模式走 measureCPUGPU，不會進到這裡
+        case .read:
+            var sums = [UInt64](repeating: 0, count: threads)
+            DispatchQueue.concurrentPerform(iterations: threads) { i in
+                let start = i * chunk
+                let end = (i == threads - 1) ? words : min(start + chunk, words)
+                sums[i] = readRun(src + start, end - start)
+            }
+            blackHole(sums.reduce(0, &+))
+        case .write:
+            DispatchQueue.concurrentPerform(iterations: threads) { i in
+                let start = i * chunk
+                let end = (i == threads - 1) ? words : min(start + chunk, words)
+                writeRun(dst + start, end - start)
+            }
+            blackHole(dst[0])
+        case .writePingPong:
+            let target = alt ? src : dst
+            DispatchQueue.concurrentPerform(iterations: threads) { i in
+                let start = i * chunk
+                let end = (i == threads - 1) ? words : min(start + chunk, words)
+                writeRun(target + start, end - start)
+            }
+            blackHole(target[0])
+        case .copy:
+            DispatchQueue.concurrentPerform(iterations: threads) { i in
+                let start = i * chunk
+                let end = (i == threads - 1) ? words : min(start + chunk, words)
+                memcpy(dst + start, src + start, (end - start) * MemoryLayout<UInt64>.size)
+            }
+            blackHole(dst[0])
+        }
+        return nsToSec(nowNs() - t0)
+    }
+
+    @inline(never)
+    static func readRun(_ p: UnsafeMutablePointer<UInt64>, _ n: Int) -> UInt64 {
+        // 8 路展開：提高每核心在途（outstanding）讀取請求數
+        var a: UInt64 = 0, b: UInt64 = 0, c: UInt64 = 0, d: UInt64 = 0
+        var e: UInt64 = 0, f: UInt64 = 0, g: UInt64 = 0, h: UInt64 = 0
+        var i = 0
+        let limit = n - (n % 8)
+        while i < limit {
+            a &+= p[i];     b &+= p[i + 1]; c &+= p[i + 2]; d &+= p[i + 3]
+            e &+= p[i + 4]; f &+= p[i + 5]; g &+= p[i + 6]; h &+= p[i + 7]
+            i += 8
+        }
+        while i < n { a &+= p[i]; i += 1 }
+        return (a &+ b) &+ (c &+ d) &+ (e &+ f) &+ (g &+ h)
+    }
+
+    @inline(never)
+    static func writeRun(_ p: UnsafeMutablePointer<UInt64>, _ n: Int) {
+        let pattern: UInt64 = 0x0123456789ABCDEF
+        var i = 0
+        let limit = n - (n % 8)
+        while i < limit {
+            p[i] = pattern; p[i + 1] = pattern; p[i + 2] = pattern; p[i + 3] = pattern
+            p[i + 4] = pattern; p[i + 5] = pattern; p[i + 6] = pattern; p[i + 7] = pattern
+            i += 8
+        }
+        while i < n { p[i] = pattern; i += 1 }
+    }
+
+    // MARK: Metal
+
+    private func prepareMetal() -> Bool {
+        if gpuPso != nil, mtlQueue != nil { return true }
+        guard let device = mtlDevice,
+              let queue = device.makeCommandQueue(),
+              let lib = try? device.makeLibrary(source: Self.gpuKernelSource, options: nil),
+              let fn = lib.makeFunction(name: "bw_read"),
+              let pso = try? device.makeComputePipelineState(function: fn) else { return false }
+        mtlQueue = queue
+        gpuPso = pso
+        return true
+    }
+
+    /// 配置 GPU buffer；private storage 需先填值，避免讀取未初始化記憶體。
+    private func setupGPUBuffers(bytes: Int) -> Bool {
+        guard prepareMetal(), let device = mtlDevice, let queue = mtlQueue else { return false }
+        let gpuBytes = min(bytes, 256 * 1024 * 1024)
+        if let existing = gpuBuf, Int(existing.length) == gpuBytes, gpuOutBuf != nil { return true }
+
+        guard let buf = device.makeBuffer(length: gpuBytes, options: .storageModePrivate),
+              let out = device.makeBuffer(length: gpuThreads * 16, options: .storageModeShared),
+              let cb = queue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return false }
+        blit.__fill(buf, range: NSRange(location: 0, length: gpuBytes), value: 0)
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        gpuBuf = buf
+        gpuOutBuf = out
+        return true
+    }
+
+    /// 在單一 command buffer 內連續跑多輪 GPU 讀取，降低每輪提交／等待的固定開銷。
+    private func gpuBurst(passes: Int) -> Double? {
+        guard let queue = mtlQueue, let pso = gpuPso,
+              let buf = gpuBuf, let out = gpuOutBuf,
+              let cb = queue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { return nil }
+        var count = UInt32(buf.length / 16)   // float4 = 16 bytes
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(buf, offset: 0, index: 0)
+        enc.setBuffer(out, offset: 0, index: 1)
+        enc.setBytes(&count, length: 4, index: 2)
+        for _ in 0..<passes {
+            enc.dispatchThreads(MTLSize(width: gpuThreads, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        return Double(buf.length) * Double(passes)
+    }
+
+    /// CPU 全部執行緒在計時窗內持續掃描，GPU 同時連續讀取。
+    func measureCPUGPU(src: UnsafeMutablePointer<UInt64>, words: Int, threads: Int)
+        -> (total: Double, cpu: Double, gpu: Double, secs: Double) {
+        let chunk = max(64, (words / threads) & ~63)
+        let perThread = UnsafeMutablePointer<Double>.allocate(capacity: threads)
+        perThread.initialize(repeating: 0, count: threads)
+        let sinkOut = UnsafeMutablePointer<UInt64>.allocate(capacity: threads)
+        sinkOut.initialize(repeating: 0, count: threads)
+        defer {
+            perThread.deinitialize(count: threads); perThread.deallocate()
+            sinkOut.deinitialize(count: threads); sinkOut.deallocate()
+        }
+
+        let stop = StopFlag()
+        let group = DispatchGroup()
+        for t in 0..<threads {
+            group.enter()
+            DispatchQueue.global(qos: .userInteractive).async {
+                var acc: UInt64 = 0
+                var n = 0
+                let t0 = nowNs()   // 每條執行緒從自己實際開跑時開始計時
+                while !stop.value {
+                    acc &+= Runner.readRun(src + t * chunk, chunk)
+                    n += 1
+                }
+                let el = max(nsToSec(nowNs() - t0), 0.001)
+                perThread[t] = Double(n) * Double(chunk * 8) / el / 1e9
+                sinkOut[t] = acc
+                group.leave()
+            }
+        }
+
+        // GPU 在固定 0.5 秒計時窗內連續跑，之後結束整輪
+        let windowSecs = 0.5
+        let passesPerBurst = 4
+        let wStart = nowNs()
+        var gpuBytes = 0.0
+        while nsToSec(nowNs() - wStart) < windowSecs {
+            guard let moved = gpuBurst(passes: passesPerBurst) else { break }
+            gpuBytes += moved
+        }
+        let win = max(nsToSec(nowNs() - wStart), 0.001)
+        stop.set()
+        group.wait()
+
+        // 各執行緒自行計時後加總（排程晚進場的執行緒不會稀釋結果）
+        let cpuGBps = (0..<threads).reduce(0.0) { $0 + perThread[$1] }
+        blackHole((0..<threads).reduce(UInt64(0)) { $0 &+ sinkOut[$1] })
+        let gpuGBps = gpuBytes / win / 1e9
+        return (cpuGBps + gpuGBps, cpuGBps, gpuGBps, win)
+    }
+}
+
+// MARK: - 介面
+
+struct ContentView: View {
+    @StateObject private var runner = Runner()
+    @State private var sizeMB: Int = 256
+    @State private var threads: Int = logicalCores
+    @State private var iterations: Int = 5
+    @State private var selectedModes: Set<TestMode> = Set(TestMode.allCases)
+
+    /// 只顯示這台機器吃得下的尺寸（兩塊 buffer 不超過實體記憶體的一半）
+    private var sizeOptions: [Int] {
+        let options = [16, 64, 256, 1024]
+        let usable = machineRAMBytes / 2
+        let filtered = options.filter { UInt64($0) * 1024 * 1024 * 2 <= usable }
+        return filtered.isEmpty ? [16] : filtered
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            Divider()
+            controls
+            if runner.running || runner.progressDone > 0 {
+                ProgressView(value: Double(min(runner.progressDone, runner.progressTotal)),
+                             total: Double(runner.progressTotal))
+                    .progressViewStyle(.linear)
+            }
+            if let err = runner.errorMessage {
+                Text(err).foregroundStyle(.red).font(.callout)
+            }
+            resultsSection
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .frame(minWidth: 780, minHeight: 600)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Memory Bandwidth Bench")
+                .font(.title2.weight(.semibold))
+            Text("\(machineChip)・\(formatGB(machineRAMBytes)) RAM・\(coreSummary)")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let spec = currentChipSpec {
+                Text("原廠規格：記憶體頻寬 \(spec.officialText)（LPDDR 匯流排理論峰值，實測通常約 50–80%）")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var controls: some View {
+        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 12) {
+            GridRow {
+                Text("緩衝區大小")
+                Picker("", selection: $sizeMB) {
+                    ForEach(sizeOptions, id: \.self) { Text("\($0) MB").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .disabled(runner.running)
+                .help("小尺寸（16／64 MB）會被 L2 快取吸收，數字會明顯高於真實 DRAM 頻寬；量測 DRAM 請用 256 MB 以上")
+            }
+            GridRow {
+                Text("執行緒數")
+                Stepper(value: $threads, in: 1...max(1, logicalCores)) {
+                    Text("\(threads)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
+                }
+                .disabled(runner.running)
+            }
+            GridRow {
+                Text("每項迭代")
+                Stepper(value: $iterations, in: 1...20) {
+                    Text("\(iterations)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
+                }
+                .disabled(runner.running)
+            }
+            GridRow {
+                Text("測試項目")
+                HStack(spacing: 16) {
+                    ForEach(TestMode.allCases) { mode in
+                        Toggle(isOn: binding(for: mode)) {
+                            Text(mode.rawValue).help(mode.detail)
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                }
+                .disabled(runner.running)
+            }
+            GridRow {
+                HStack(spacing: 12) {
+                    Button(runner.running ? "測試中…" : "開始測試") { start() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(runner.running || selectedModes.isEmpty)
+
+                    Button("停止") { runner.cancel() }
+                        .disabled(!runner.running)
+
+                    Button("匯出 CSV") { exportCSV() }
+                        .disabled(runner.results.isEmpty)
+                }
+                Text(runner.statusText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func start() {
+        let modes = TestMode.allCases.filter { selectedModes.contains($0) }
+        guard !modes.isEmpty else {
+            runner.errorMessage = "請至少選擇一種測試項目。"
+            return
+        }
+        runner.errorMessage = nil
+        runner.run(sizeMB: sizeMB, threads: threads, iterations: iterations, modes: modes)
+    }
+
+    private func binding(for mode: TestMode) -> Binding<Bool> {
+        Binding(
+            get: { selectedModes.contains(mode) },
+            set: { on in
+                if on { selectedModes.insert(mode) } else { selectedModes.remove(mode) }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var resultsSection: some View {
+        if runner.results.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 42))
+                    .foregroundStyle(.tertiary)
+                Text("設定好參數後按「開始測試」")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                Chart {
+                    ForEach(runner.results) { r in
+                        BarMark(
+                            x: .value("測試", r.mode.rawValue),
+                            y: .value("GB/s", r.avgGBps)
+                        )
+                        .annotation(position: .top) {
+                            Text(String(format: "%.1f", r.avgGBps))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let spec = currentChipSpec {
+                        RuleMark(y: .value("原廠", spec.baselineGBps))
+                            .foregroundStyle(.orange)
+                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [6, 3]))
+                            .annotation(position: .top, alignment: .trailing) {
+                                Text("原廠 \(spec.officialText)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            }
+                    }
+                }
+                .chartYAxisLabel("GB/s")
+                .chartYScale(domain: 0...(max(runner.results.map { $0.avgGBps }.max() ?? 1,
+                                                  currentChipSpec?.baselineGBps ?? 0) * 1.08))
+                .frame(height: 180)
+
+                Table(runner.results) {
+                    TableColumn("測試項目") { Text($0.mode.rawValue) }
+                    TableColumn("平均 GB/s") { Text(String(format: "%.1f", $0.avgGBps)).monospacedDigit() }
+                    TableColumn("峰值 GB/s") { Text(String(format: "%.1f", $0.peakGBps)).monospacedDigit() }
+                    TableColumn("達原廠 %") { r in
+                        if let spec = currentChipSpec {
+                            Text(String(format: "%.0f%%", r.avgGBps / spec.baselineGBps * 100)).monospacedDigit()
+                                .foregroundStyle(r.avgGBps / spec.baselineGBps >= 0.75 ? .green : .secondary)
+                        } else {
+                            Text("—").foregroundStyle(.tertiary)
+                        }
+                    }
+                    TableColumn("平均耗時 ms") { Text(String(format: "%.1f", $0.avgMs)).monospacedDigit() }
+                    TableColumn("CPU／GPU 分項") { r in
+                        if let c = r.cpuGBps, let g = r.gpuGBps {
+                            Text(String(format: "CPU %.1f ＋ GPU %.1f", c, g)).monospacedDigit()
+                        } else {
+                            Text("—").foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func exportCSV() {
+        guard let run = runner.lastRun else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "memory-bandwidth-\(run.sizeMB)MB-\(run.threads)T.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let iso = ISO8601DateFormatter().string(from: run.startedAt)
+            let official = currentChipSpec?.baselineGBps
+            var csv = "run_started,size_mb,threads,iterations,mode,avg_GBps,peak_GBps,avg_ms,cpu_GBps,gpu_GBps,official_GBps,pct_of_official\n"
+            for r in runner.results {
+                let c = r.cpuGBps.map { String(format: "%.2f", $0) } ?? ""
+                let g = r.gpuGBps.map { String(format: "%.2f", $0) } ?? ""
+                let o = official.map { String(format: "%.0f", $0) } ?? ""
+                let pct = official.map { String(format: "%.1f", r.avgGBps / $0 * 100) } ?? ""
+                csv += "\(iso),\(run.sizeMB),\(run.threads),\(run.iterations),\(r.mode.rawValue),\(String(format: "%.2f", r.avgGBps)),\(String(format: "%.2f", r.peakGBps)),\(String(format: "%.2f", r.avgMs)),\(c),\(g),\(o),\(pct)\n"
+            }
+            try? csv.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
+@main
+struct MemoryBandwidthBenchApp: App {
+    var body: some Scene {
+        WindowGroup("Memory Bandwidth Bench") {
+            ContentView()
+        }
+    }
+}

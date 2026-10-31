@@ -1,0 +1,7 @@
+# build artifacts (rebuild with ./build.sh)
+MemoryBandwidthBench
+MemoryBandwidthBench.app/
+*.dmg
+
+# macOS
+.DS_Store
