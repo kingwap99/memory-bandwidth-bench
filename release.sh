@@ -7,12 +7,19 @@ cd "$(dirname "$0")"
 
 BUMP=${1:-patch}
 
-# Refuse to fold unrelated edits into the Release commit.
-if ! git diff --quiet || ! git diff --cached --quiet; then
+# Refuse to fold unrelated edits or stray untracked files into the Release commit.
+if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
   echo "working tree has uncommitted changes; commit or stash them first"
   git status --short
   exit 1
 fi
+# Fail fast when another machine already pushed main or new tags.
+git fetch --tags origin || true
+if ! git merge-base --is-ancestor origin/main HEAD; then
+  echo "local main is behind origin/main; pull first"
+  exit 1
+fi
+
 PB=/usr/libexec/PlistBuddy
 PLIST=Info.plist
 
