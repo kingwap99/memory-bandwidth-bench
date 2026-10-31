@@ -1,4 +1,6 @@
-# Memory Bandwidth Bench
+<p align="center"><img src="icons/icon-C.png" alt="Memory Bandwidth Bench icon" width="128" height="128"></p>
+
+<h1 align="center">Memory Bandwidth Bench</h1>
 
 A single-file SwiftUI app that measures memory bandwidth on Apple Silicon (and Intel) Macs.
 
