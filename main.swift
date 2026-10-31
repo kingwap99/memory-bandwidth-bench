@@ -28,6 +28,9 @@ func sysctlUInt64(_ name: String) -> UInt64? {
     return v
 }
 
+let appVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+let appTitle = "Memory Bandwidth Bench v\(appVersion)"
+
 let machineChip = sysctlString("machdep.cpu.brand_string")
 let machineRAMBytes = sysctlUInt64("hw.memsize") ?? 0
 let logicalCores = max(1, sysctlInt32("hw.ncpu") ?? ProcessInfo.processInfo.activeProcessorCount)
@@ -674,7 +677,7 @@ struct ContentView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Memory Bandwidth Bench")
+            Text(appTitle)
                 .font(.title2.weight(.semibold))
             Text("\(machineChip)・\(formatGB(machineRAMBytes)) RAM・\(coreSummary)")
                 .font(.callout)
@@ -855,7 +858,7 @@ struct ContentView: View {
 @main
 struct MemoryBandwidthBenchApp: App {
     var body: some Scene {
-        WindowGroup(L.t("記憶體頻寬測試", "Memory Bandwidth Bench")) {
+        WindowGroup(L.t("記憶體頻寬測試", "Memory Bandwidth Bench") + " v\(appVersion)") {
             ContentView()
         }
     }
