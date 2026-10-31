@@ -4,7 +4,7 @@ import AppKit
 import Metal
 import IOKit
 
-// MARK: - 系統資訊
+// MARK: - System info
 
 func sysctlString(_ name: String) -> String {
     var size = 0
@@ -37,7 +37,7 @@ let logicalCores = max(1, sysctlInt32("hw.ncpu") ?? ProcessInfo.processInfo.acti
 let performanceCores = sysctlInt32("hw.perflevel0.physicalcpu") ?? 0
 let efficiencyCores = sysctlInt32("hw.perflevel1.physicalcpu") ?? 0
 
-/// 從 IORegistry 讀 GPU 核心數（多配置晶片用它判定官方頻寬）；讀不到回傳 0
+/// GPU core count from IORegistry (resolves multi-config official bandwidth); 0 if unavailable
 let gpuCoreCount: Int = {
     var iter = io_iterator_t()
     guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iter) == KERN_SUCCESS else { return 0 }
@@ -57,7 +57,7 @@ let gpuCoreCount: Int = {
     return cores
 }()
 
-// MARK: - 語系自動偵測（繁中／简中／英文）
+// MARK: - Automatic UI language detection (Traditional / Simplified Chinese / English)
 
 enum UILang { case zhHant, zhHans, en }
 
@@ -99,24 +99,24 @@ var coreSummary: String {
 }
 
 func formatGB(_ bytes: UInt64) -> String {
-    // 用二進位單位：17179869184 bytes = 16 GiB（Apple 標示的 16 GB）
+    // Binary units: 17179869184 bytes = 16 GiB (what Apple labels as 16 GB)
     let gb = Double(bytes) / 1_073_741_824
     if gb >= 1 { return String(format: "%.0f GB", gb) }
     return String(format: "%.0f MB", Double(bytes) / 1_048_576)
 }
 
 
-// MARK: - Apple 官方記憶體頻寬規格（參考用）
+// MARK: - Apple official memory bandwidth specs (reference)
 
 struct ChipSpec: Identifiable {
-    let label: String                    // 晶片家族
-    let lowText: String                  // 標準版官方頻寬（如 "460"）
-    var highText: String? = nil          // 高配版官方頻寬（如 "614"）
-    var gpuHighThreshold: Int? = nil     // GPU 核心數 ≥ 此值 → 高配頻寬
-    var ramHighThresholdGB: Int? = nil   // RAM ≥ 此值 → 高配頻寬
+    let label: String                    // chip family
+    let lowText: String                  // standard-config official bandwidth (e.g. "460")
+    var highText: String? = nil          // high-end config bandwidth (e.g. "614")
+    var gpuHighThreshold: Int? = nil     // GPU cores >= this value -> high-config bandwidth
+    var ramHighThresholdGB: Int? = nil   // RAM >= this value -> high-config bandwidth
     var id: String { label }
 
-    /// nil＝讀不到判定依據（退回顯示兩個數字）
+    /// nil = detection unavailable (fall back to showing both numbers)
     private var isHigh: Bool? {
         guard highText != nil else { return false }
         if let t = gpuHighThreshold {
@@ -150,7 +150,7 @@ struct ChipSpec: Identifiable {
     }
 }
 
-/// 數字取自 Apple 官方技術規格頁（tech specs）；同家族不同配置頻寬不同，實際以官網為準。
+/// Numbers taken from Apple's official tech-spec pages; bandwidth varies by configuration within a family.
 let appleChipSpecs: [ChipSpec] = [
     ChipSpec(label: "M1", lowText: "68.25"),
     ChipSpec(label: "M1 Pro", lowText: "200"),
@@ -171,19 +171,19 @@ let appleChipSpecs: [ChipSpec] = [
     ChipSpec(label: "M5 Max", lowText: "460", highText: "614", gpuHighThreshold: 40),
 ]
 
-/// 依 brand_string 匹配晶片家族；先比對較長的 label，避免「M5 Max」被「M5」搶先媒合。
+/// Match the chip family from brand_string; longest label first so "M5 Max" is not matched by "M5".
 let currentChipSpec: ChipSpec? = {
     let chip = machineChip
     return appleChipSpecs
         .sorted { $0.label.count > $1.label.count }
         .first { chip.localizedCaseInsensitiveContains($0.label) }
 }()
-// MARK: - 單調時鐘與防最佳化
+// MARK: - Monotonic clock and anti-optimization
 
 @inline(__always) func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 @inline(__always) func nsToSec(_ ns: UInt64) -> Double { Double(ns) / 1_000_000_000 }
 
-/// 只在單執行緒路徑使用；多執行緒請各自寫入自己的緩衝區
+/// Single-threaded paths only; multi-threaded code writes its own buffer
 var globalSink: UInt64 = 0
 @inline(never) func blackHole(_ x: UInt64) { globalSink = x }
 
@@ -199,7 +199,7 @@ final class StopFlag {
     }
 }
 
-// MARK: - 測試模型
+// MARK: - Test model
 
 enum TestMode: String, CaseIterable, Identifiable {
     case read = "read"
@@ -207,7 +207,7 @@ enum TestMode: String, CaseIterable, Identifiable {
     case writePingPong = "write-pingpong"
     case copy = "copy"
     case cpuGpu = "cpu+gpu"
-    var id: String { rawValue }   // 穩定英文 key（CSV／除錯用）
+    var id: String { rawValue }   // stable English key (CSV / debugging)
 
     var display: String {
         switch self {
@@ -241,11 +241,11 @@ struct BenchResult: Identifiable {
     let avgGBps: Double
     let peakGBps: Double
     let avgMs: Double
-    var cpuGBps: Double? = nil   // 僅 CPU+GPU 併發模式有意義
+    var cpuGBps: Double? = nil   // meaningful only in CPU+GPU concurrent mode
     var gpuGBps: Double? = nil
 }
 
-// MARK: - 測試引擎
+// MARK: - Test engine
 
 final class Runner: ObservableObject {
     struct RunSnapshot {
@@ -266,7 +266,7 @@ final class Runner: ObservableObject {
     private let stateLock = NSLock()
     private var cancelRequested = false
 
-    // MARK: Metal（第一次用到 CPU+GPU 模式時才初始化）
+    // MARK: Metal (initialized on first use of CPU+GPU mode)
     private let mtlDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
     private var mtlQueue: MTLCommandQueue?
     private var gpuPso: MTLComputePipelineState?
@@ -301,7 +301,7 @@ final class Runner: ObservableObject {
         statusText = L.t("正在停止…", "Stopping…")
     }
 
-    // MARK: 執行流程
+    // MARK: Run flow
 
     func run(sizeMB: Int, threads: Int, iterations: Int, modes: [TestMode]) {
         guard !running else { return }
@@ -318,7 +318,7 @@ final class Runner: ObservableObject {
             options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
             reason: "Memory bandwidth benchmark running")
 
-        // userInteractive：避免測試執行緒被排到效率核而壓低讀取頻寬
+        // userInteractive: keep test threads off E-cores, which would depress read bandwidth
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self else { return }
             defer { self.finishRun() }
@@ -339,7 +339,7 @@ final class Runner: ObservableObject {
             }
             defer { free(srcRaw); free(dstRaw) }
 
-            // 首次觸碰（first-touch）讓分頁實際配置，不計入計時
+            // First touch forces real page allocation; not included in timing
             DispatchQueue.main.async { self.statusText = L.t("暖機中…", "Warming up…") }
             memset(srcRaw, 0xAB, bytes)
             memset(dstRaw, 0xCD, bytes)
@@ -364,8 +364,8 @@ final class Runner: ObservableObject {
     private func runCPUMode(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
                             dst: UnsafeMutablePointer<UInt64>, bytes: Int, words: Int,
                             threads: Int, iterations: Int) {
-        // 暖身一次（不計入）：讓 CPU 升頻、TLB/分頁穩定。
-        // 乒乓模式暖身寫 src，讓第 1 次正式迭代（寫 dst）就開始交替。
+        // Warm-up pass (untimed): let CPU clocks and TLB/pages settle.
+        // Ping-pong warm-up writes src so iteration 1 (writing dst) alternates immediately.
         _ = Runner.measure(mode: mode, src: src, dst: dst, words: words, threads: threads, alt: true)
 
         var gbps: [Double] = []
@@ -400,7 +400,7 @@ final class Runner: ObservableObject {
             }
             return
         }
-        _ = measureCPUGPU(src: src, words: words, threads: threads)   // 暖身
+        _ = measureCPUGPU(src: src, words: words, threads: threads)   // warm-up
 
         var totals: [Double] = []
         var cpuPart: [Double] = []
@@ -427,7 +427,7 @@ final class Runner: ObservableObject {
         }
     }
 
-    /// 統一的收尾：確保電源斷言一定會釋放（含配置失敗、取消等所有路徑）
+    /// Single exit path: guarantees the power assertion is released (alloc failure, cancel, etc.)
     private func finishRun() {
         let cancelled = isCancelled
         DispatchQueue.main.async {
@@ -440,9 +440,9 @@ final class Runner: ObservableObject {
         }
     }
 
-    // MARK: 量測
+    // MARK: Measurement
 
-    /// 回傳秒數。短於 20 ms 的測試會自動重複多輪，壓低執行緒喚醒造成的誤差。
+    /// Returns seconds. Runs shorter than 20 ms repeat automatically to amortize thread-wakeup jitter.
     static func measure(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
                         dst: UnsafeMutablePointer<UInt64>, words: Int, threads: Int,
                         alt: Bool) -> Double {
@@ -456,18 +456,18 @@ final class Runner: ObservableObject {
             _ = measureOnce(mode: mode, src: src, dst: dst, words: words,
                             threads: threads, alt: alt)
         }
-        // 回傳「單趟平均」，呼叫端才不會把重複次數算成額外搬運量
+        // Returns the per-pass average so callers do not count repeats as extra traffic
         return nsToSec(nowNs() - t0) / Double(reps)
     }
 
     private static func measureOnce(mode: TestMode, src: UnsafeMutablePointer<UInt64>,
                                     dst: UnsafeMutablePointer<UInt64>, words: Int,
                                     threads: Int, alt: Bool) -> Double {
-        let chunk = max(64, (words / threads) & ~63)   // 對齊 512 bytes
+        let chunk = max(64, (words / threads) & ~63)   // align to 512 bytes
         let t0 = nowNs()
         switch mode {
         case .cpuGpu:
-            return 0   // 併發模式走 measureCPUGPU，不會進到這裡
+            return 0   // concurrent mode uses measureCPUGPU; unreachable here
         case .read:
             var sums = [UInt64](repeating: 0, count: threads)
             DispatchQueue.concurrentPerform(iterations: threads) { i in
@@ -504,7 +504,7 @@ final class Runner: ObservableObject {
 
     @inline(never)
     static func readRun(_ p: UnsafeMutablePointer<UInt64>, _ n: Int) -> UInt64 {
-        // 8 路展開：提高每核心在途（outstanding）讀取請求數
+        // 8-way unroll: raise outstanding read requests per core
         var a: UInt64 = 0, b: UInt64 = 0, c: UInt64 = 0, d: UInt64 = 0
         var e: UInt64 = 0, f: UInt64 = 0, g: UInt64 = 0, h: UInt64 = 0
         var i = 0
@@ -545,7 +545,7 @@ final class Runner: ObservableObject {
         return true
     }
 
-    /// 配置 GPU buffer；private storage 需先填值，避免讀取未初始化記憶體。
+    /// Allocate GPU buffers; private storage must be pre-filled to avoid reading uninitialized memory.
     private func setupGPUBuffers(bytes: Int) -> Bool {
         guard prepareMetal(), let device = mtlDevice, let queue = mtlQueue else { return false }
         let gpuBytes = min(bytes, 256 * 1024 * 1024)
@@ -564,7 +564,7 @@ final class Runner: ObservableObject {
         return true
     }
 
-    /// 在單一 command buffer 內連續跑多輪 GPU 讀取，降低每輪提交／等待的固定開銷。
+    /// Batch multiple GPU read passes into one command buffer to cut per-pass submit/wait overhead.
     private func gpuBurst(passes: Int) -> Double? {
         guard let queue = mtlQueue, let pso = gpuPso,
               let buf = gpuBuf, let out = gpuOutBuf,
@@ -585,7 +585,7 @@ final class Runner: ObservableObject {
         return Double(buf.length) * Double(passes)
     }
 
-    /// CPU 全部執行緒在計時窗內持續掃描，GPU 同時連續讀取。
+    /// All CPU threads scan within the timed window while the GPU reads back-to-back.
     func measureCPUGPU(src: UnsafeMutablePointer<UInt64>, words: Int, threads: Int)
         -> (total: Double, cpu: Double, gpu: Double, secs: Double) {
         let chunk = max(64, (words / threads) & ~63)
@@ -605,7 +605,7 @@ final class Runner: ObservableObject {
             DispatchQueue.global(qos: .userInteractive).async {
                 var acc: UInt64 = 0
                 var n = 0
-                let t0 = nowNs()   // 每條執行緒從自己實際開跑時開始計時
+                let t0 = nowNs()   // each thread times from when it actually starts
                 while !stop.value {
                     acc &+= Runner.readRun(src + t * chunk, chunk)
                     n += 1
@@ -617,7 +617,7 @@ final class Runner: ObservableObject {
             }
         }
 
-        // GPU 在固定 0.5 秒計時窗內連續跑，之後結束整輪
+        // GPU runs back-to-back inside a fixed 0.5 s window, then ends the round
         let windowSecs = 0.5
         let passesPerBurst = 4
         let wStart = nowNs()
@@ -630,7 +630,7 @@ final class Runner: ObservableObject {
         stop.set()
         group.wait()
 
-        // 各執行緒自行計時後加總（排程晚進場的執行緒不會稀釋結果）
+        // per-thread timings summed (late-scheduled threads do not dilute the result)
         let cpuGBps = (0..<threads).reduce(0.0) { $0 + perThread[$1] }
         blackHole((0..<threads).reduce(UInt64(0)) { $0 &+ sinkOut[$1] })
         let gpuGBps = gpuBytes / win / 1e9
@@ -638,7 +638,7 @@ final class Runner: ObservableObject {
     }
 }
 
-// MARK: - 介面
+// MARK: - UI
 
 struct ContentView: View {
     @StateObject private var runner = Runner()
@@ -647,7 +647,7 @@ struct ContentView: View {
     @State private var iterations: Int = 5
     @State private var selectedModes: Set<TestMode> = Set(TestMode.allCases)
 
-    /// 只顯示這台機器吃得下的尺寸（兩塊 buffer 不超過實體記憶體的一半）
+    /// Only sizes this machine can hold (two buffers <= half of physical RAM)
     private var sizeOptions: [Int] {
         let options = [16, 64, 256, 1024]
         let usable = machineRAMBytes / 2

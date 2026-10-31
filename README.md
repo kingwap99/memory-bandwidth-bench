@@ -1,15 +1,73 @@
 # Memory Bandwidth Bench
 
-單檔 SwiftUI 應用程式，量測 Apple Silicon（及 Intel Mac）的記憶體頻寬。
+A single-file SwiftUI app that measures memory bandwidth on Apple Silicon (and Intel) Macs.
 
-## 建置與執行
+A macOS GUI app that measures real memory bandwidth and compares it against Apple's official spec, with automatic UI language detection (Traditional Chinese / Simplified Chinese / English).
+
+## Build & Run
 
     ./build.sh
     open MemoryBandwidthBench.app
 
-build.sh 會編譯 main.swift、更新 .app bundle 並做 ad-hoc 簽章。需要 Xcode Command Line Tools。
+`build.sh` compiles `main.swift`, refreshes the `.app` bundle, and ad-hoc signs it. Requires Xcode Command Line Tools.
 
-## 測試項目
+## Release
+
+    ./release.sh          # patch bump: 1.0.4 -> 1.0.5
+    ./release.sh minor    # 1.0.4 -> 1.1.0
+    ./release.sh major    # 1.0.4 -> 2.0.0
+
+The git tag is the single source of truth. One command bumps the version, rebuilds, packages the DMG, pushes the tag, and publishes a GitHub Release with the DMG attached.
+
+## Tests
+
+| Test | Description |
+|---|---|
+| Read | Each thread scans its own buffer, 8-way unrolled uint64 accumulation to raise outstanding requests |
+| Write | 8-way unrolled stores into the same buffer (results may be absorbed by caches) |
+| Write (ping-pong) | Alternates two buffers each iteration so dirty lines must be evicted, closer to sustained DRAM write bandwidth |
+| Copy | memcpy; traffic counts both read and write bytes |
+| CPU+GPU concurrent | All CPU threads scan while a Metal kernel reads at the same time; the total is closest to the SoC ceiling |
+
+## Official spec baseline
+
+- The app matches `machdep.cpu.brand_string` against a built-in table of Apple official specs (M1 through M5 families) and shows the official bandwidth next to your results, with an orange dashed baseline in the chart and a "% of official" column (also exported to CSV).
+- Bandwidth varies by configuration within a family (e.g. M5 Max: 32-core GPU = 460 GB/s, 40-core GPU = 614 GB/s). The app reads `gpu-core-count` from IORegistry to pick the right number automatically; if unavailable it falls back to showing both. M5 is resolved by RAM size (16 GB = 153, 24/32 GB = 170).
+- Numbers come from Apple's official tech-spec pages; always check apple.com for the authoritative values.
+
+## Measurement notes
+
+- Sizes below L2 (16/64 MB) are absorbed by cache and read far above real DRAM bandwidth; use 256 MB or more to measure DRAM.
+- Bandwidth is affected by App Nap, other apps, and thermals; the app holds a power assertion during tests to avoid downclocking.
+- CPU-only reads are bound by Little's Law (outstanding requests x 64 B / latency) and typically reach ~50% of theoretical peak; CPU+GPU concurrent reaches ~75-80%. The 200 GB/s figure for M1 Pro is the LPDDR bus theoretical peak.
+- "Peak" is the best of the timed iterations; each iteration auto-repeats to fill a 20 ms timing window and reduce scheduling jitter.
+
+## Language / 語系
+
+The UI detects the system language at launch: Traditional Chinese (zh-Hant), Simplified Chinese (zh-Hans, converted automatically via CoreText), or English. The app title always carries the version suffix (e.g. "Memory Bandwidth Bench v1.0.5").
+
+---
+
+## 中文說明
+
+單檔 SwiftUI 應用程式，在 Apple Silicon（及 Intel）Mac 上量測真實記憶體頻寬，並與 Apple 官方規格對照。介面語系自動偵測（繁中／简中／英文）。
+
+### 建置與執行
+
+    ./build.sh
+    open MemoryBandwidthBench.app
+
+`build.sh` 會編譯 `main.swift`、更新 `.app` bundle 並做 ad-hoc 簽章。需要 Xcode Command Line Tools。
+
+### 發布新版本
+
+    ./release.sh          # patch：1.0.4 -> 1.0.5
+    ./release.sh minor   # 1.0.4 -> 1.1.0
+    ./release.sh major   # 1.0.4 -> 2.0.0
+
+版號唯一來源是 git tag。一條指令完成：累進版號、編譯、打包 DMG、推 tag、發布 GitHub Release。
+
+### 測試項目
 
 | 項目 | 說明 |
 |---|---|
@@ -19,26 +77,28 @@ build.sh 會編譯 main.swift、更新 .app bundle 並做 ad-hoc 簽章。需要
 | 複製 | memcpy，流量計入讀＋寫雙向位元組 |
 | CPU+GPU併發 | CPU 全執行緒掃描的同時，Metal kernel 讓 GPU 一起讀取；合計值最接近整機上限 |
 
-## 原廠規格對照
+### 原廠規格對照
 
-- App 依 `machdep.cpu.brand_string` 自動匹配內建的晶片規格表（M1～M5 全系，數字取自 Apple 官方技術規格頁），
-  在標題列顯示原廠記憶體頻寬，圖表畫橘色虛線基準，結果表格多一欄「達原廠 %」，CSV 匯出附 `official_GBps` 與 `pct_of_official`。
-- 同家族不同配置頻寬不同（例如 M5 Max：32 核 GPU＝460 GB/s、40 核 GPU＝614 GB/s）。App 會從 IORegistry 讀取 gpu-core-count 自動判定該機配置並顯示對應數字；讀不到時退回顯示兩個數字。M5 依記憶體容量判定（16GB＝153、24／32GB＝170）。
+- App 依 `machdep.cpu.brand_string` 自動匹配內建規格表（M1～M5 全系），顯示原廠頻寬、圖表橘色虛線基準與「達原廠 %」欄（CSV 亦含）。
+- 同家族不同配置頻寬不同（例如 M5 Max：32 核 GPU＝460 GB/s、40 核 GPU＝614 GB/s）。App 從 IORegistry 讀取 `gpu-core-count` 自動判定；讀不到時退回顯示兩個數字。M5 依記憶體容量判定（16GB＝153、24／32GB＝170）。
+- 數字取自 Apple 官方技術規格頁；實際以 apple.com 為準。
 
-## 量測注意事項
+### 量測注意事項
 
 - 小於 L2 的尺寸（16／64 MB）會被快取吸收，數字遠高於 DRAM 頻寬；要看 DRAM 請用 256 MB 以上。
-- 記憶體頻寬受 App Nap、其他 App 負載、溫度影響；程式在測試期間會持有 beginActivity 斷言避免降頻。
-- CPU 端讀取受 Little's Law 限制（在途請求數 × 64B ÷ 延遲），單靠 CPU 通常只能吃到理論峰值的 5 成上下；
-  CPU＋GPU 併發約可到 75–80%。M1 Pro 的 200 GB/s 是匯流排理論峰值。
-- 「峰值」是各次迭代中最好的一次；每次迭代本身已含自動重複（湊滿 20 ms 計時窗）以壓低排程誤差。
+- 頻寬受 App Nap、其他 App 負載、溫度影響；測試期間持有電源斷言避免降頻。
+- CPU 端讀取受 Little's Law 限制，通常約為理論峰值 5 成；CPU＋GPU 併發約 75–80%。
+- 「峰值」是各次迭代中最好的一次；每次迭代自動重複以湊滿 20 ms 計時窗、壓低排程誤差。
 
-## 檔案
+### 簽章提醒
 
-- main.swift — 全部程式碼（UI + 量測核心 + Metal kernel）
-- build.sh — 建置腳本
-- make_dmg.sh — 打包 DMG（拖曳安裝格式）
-- tools-icon-render.swift — App icon 渲染腳本（CoreGraphics，產生 icons/icon-A/B/C.png）
-- icons/ — 1024×1024 icon 來源圖（App 採用樣式 C）
-- MemoryBandwidthBench.app — 建置產物
-- MemoryBandwidthBench-<版本>.dmg — 安裝映像
+Ad-hoc 簽章、未經 Apple 公證。本機使用請在首次開啟時對 app 按兩下選「打開」；經瀏覽器或郵件下載分發給他人時可能被 Gatekeeper 阻擋。
+
+## Files
+
+- `main.swift` — all source (UI + measurement core + Metal kernel)
+- `build.sh` — build script
+- `make_dmg.sh` — package the DMG (drag-to-install)
+- `release.sh` — version bump + build + DMG + tag + GitHub Release
+- `tools-icon-render.swift` — app icon renderer (CoreGraphics; outputs icons/icon-A/B/C.png)
+- `icons/` — 1024x1024 icon sources (the app uses style C)
