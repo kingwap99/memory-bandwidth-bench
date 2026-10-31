@@ -33,11 +33,45 @@ let logicalCores = max(1, sysctlInt32("hw.ncpu") ?? ProcessInfo.processInfo.acti
 let performanceCores = sysctlInt32("hw.perflevel0.physicalcpu") ?? 0
 let efficiencyCores = sysctlInt32("hw.perflevel1.physicalcpu") ?? 0
 
+// MARK: - 語系自動偵測（繁中／简中／英文）
+
+enum UILang { case zhHant, zhHans, en }
+
+enum L {
+    static let lang: UILang = {
+        guard let first = Locale.preferredLanguages.first else { return .en }
+        if first.contains("Hans") { return .zhHans }
+        if first.hasPrefix("zh") { return .zhHant }
+        return .en
+    }()
+
+    static func t(_ zh: String, _ en: String) -> String {
+        switch lang {
+        case .en: return en
+        case .zhHans: return toHans(zh)
+        case .zhHant: return zh
+        }
+    }
+
+    static func toHans(_ s: String) -> String {
+        guard lang == .zhHans else { return s }
+        let m = NSMutableString(string: s)
+        CFStringTransform(m, nil, "Hant-Hans" as CFString, false)
+        return m as String
+    }
+
+    static func threadsSuffix(_ n: Int) -> String { t("\(n) 執行緒", "\(n) threads") }
+    static func pass(_ i: Int, _ n: Int, _ mode: String) -> String {
+        t("\(mode) 第 \(i)/\(n) 次…", "\(mode): pass \(i)/\(n)…")
+    }
+    static let specNoteGPU = t("（依 GPU 配置）", "(by GPU config)")
+}
+
 var coreSummary: String {
     if performanceCores > 0, efficiencyCores > 0 {
-        return "\(performanceCores)P+\(efficiencyCores)E・\(logicalCores) 執行緒"
+        return "\(performanceCores)P+\(efficiencyCores)E・\(L.threadsSuffix(logicalCores))"
     }
-    return "\(logicalCores) 執行緒"
+    return L.threadsSuffix(logicalCores)
 }
 
 func formatGB(_ bytes: UInt64) -> String {
@@ -54,28 +88,34 @@ struct ChipSpec: Identifiable {
     let label: String        // 晶片家族
     let officialText: String // Apple 官網標示的記憶體頻寬
     let baselineGBps: Double // 畫基準線用；多配置家族取標準版
+    var multiConfig: Bool = false // 同家族依配置有不同官方頻寬
     var id: String { label }
+    var officialDisplay: String {
+        let sep = L.lang == .en ? "/" : "\u{FF0F}"
+        let base = officialText.replacingOccurrences(of: "\u{FF0F}", with: sep) + " GB/s"
+        return multiConfig ? base + " " + L.specNoteGPU : base
+    }
 }
 
 /// 數字取自 Apple 官方技術規格頁（tech specs）；同家族不同配置頻寬不同，實際以官網為準。
 let appleChipSpecs: [ChipSpec] = [
-    ChipSpec(label: "M1", officialText: "68.25 GB/s", baselineGBps: 68),
-    ChipSpec(label: "M1 Pro", officialText: "200 GB/s", baselineGBps: 200),
-    ChipSpec(label: "M1 Max", officialText: "400 GB/s", baselineGBps: 400),
-    ChipSpec(label: "M1 Ultra", officialText: "800 GB/s", baselineGBps: 800),
-    ChipSpec(label: "M2", officialText: "100 GB/s", baselineGBps: 100),
-    ChipSpec(label: "M2 Pro", officialText: "200 GB/s", baselineGBps: 200),
-    ChipSpec(label: "M2 Max", officialText: "400 GB/s", baselineGBps: 400),
-    ChipSpec(label: "M2 Ultra", officialText: "800 GB/s", baselineGBps: 800),
-    ChipSpec(label: "M3", officialText: "100 GB/s", baselineGBps: 100),
-    ChipSpec(label: "M3 Pro", officialText: "150 GB/s", baselineGBps: 150),
-    ChipSpec(label: "M3 Max", officialText: "300／400 GB/s（依 GPU 配置）", baselineGBps: 300),
-    ChipSpec(label: "M4", officialText: "120 GB/s", baselineGBps: 120),
-    ChipSpec(label: "M4 Pro", officialText: "273 GB/s", baselineGBps: 273),
-    ChipSpec(label: "M4 Max", officialText: "410／546 GB/s（依 GPU 配置）", baselineGBps: 410),
-    ChipSpec(label: "M5", officialText: "153／170 GB/s（依配置）", baselineGBps: 153),
-    ChipSpec(label: "M5 Pro", officialText: "307 GB/s", baselineGBps: 307),
-    ChipSpec(label: "M5 Max", officialText: "460／614 GB/s（依 GPU 配置）", baselineGBps: 460),
+    ChipSpec(label: "M1", officialText: "68.25", baselineGBps: 68),
+    ChipSpec(label: "M1 Pro", officialText: "200", baselineGBps: 200),
+    ChipSpec(label: "M1 Max", officialText: "400", baselineGBps: 400),
+    ChipSpec(label: "M1 Ultra", officialText: "800", baselineGBps: 800),
+    ChipSpec(label: "M2", officialText: "100", baselineGBps: 100),
+    ChipSpec(label: "M2 Pro", officialText: "200", baselineGBps: 200),
+    ChipSpec(label: "M2 Max", officialText: "400", baselineGBps: 400),
+    ChipSpec(label: "M2 Ultra", officialText: "800", baselineGBps: 800),
+    ChipSpec(label: "M3", officialText: "100", baselineGBps: 100),
+    ChipSpec(label: "M3 Pro", officialText: "150", baselineGBps: 150),
+    ChipSpec(label: "M3 Max", officialText: "300／400", baselineGBps: 300, multiConfig: true),
+    ChipSpec(label: "M4", officialText: "120", baselineGBps: 120),
+    ChipSpec(label: "M4 Pro", officialText: "273", baselineGBps: 273),
+    ChipSpec(label: "M4 Max", officialText: "410／546", baselineGBps: 410, multiConfig: true),
+    ChipSpec(label: "M5", officialText: "153／170", baselineGBps: 153, multiConfig: true),
+    ChipSpec(label: "M5 Pro", officialText: "307", baselineGBps: 307),
+    ChipSpec(label: "M5 Max", officialText: "460／614", baselineGBps: 460, multiConfig: true),
 ]
 
 /// 依 brand_string 匹配晶片家族；先比對較長的 label，避免「M5 Max」被「M5」搶先媒合。
@@ -109,20 +149,35 @@ final class StopFlag {
 // MARK: - 測試模型
 
 enum TestMode: String, CaseIterable, Identifiable {
-    case read = "讀取"
-    case write = "寫入"
-    case writePingPong = "寫入(乒乓)"
-    case copy = "複製"
-    case cpuGpu = "CPU+GPU併發"
-    var id: String { rawValue }
+    case read = "read"
+    case write = "write"
+    case writePingPong = "write-pingpong"
+    case copy = "copy"
+    case cpuGpu = "cpu+gpu"
+    var id: String { rawValue }   // 穩定英文 key（CSV／除錯用）
+
+    var display: String {
+        switch self {
+        case .read:  return L.t("讀取", "Read")
+        case .write: return L.t("寫入", "Write")
+        case .writePingPong: return L.t("寫入(乒乓)", "Write (ping-pong)")
+        case .copy:  return L.t("複製", "Copy")
+        case .cpuGpu: return L.t("CPU+GPU併發", "CPU+GPU concurrent")
+        }
+    }
 
     var detail: String {
         switch self {
-        case .read:  return "每個執行緒依序讀取自己那片記憶體（8 路展開 uint64 累加，提高在途請求數）"
-        case .write: return "每個執行緒填滿自己那片記憶體（8 路展開寫入）"
-        case .writePingPong: return "每次迭代交替寫入兩塊 buffer，強迫上一輪的髒資料在本輪逐出，更貼近真實 DRAM 寫入頻寬"
-        case .copy:  return "memcpy：src → dst，流量計入讀＋寫雙向位元組"
-        case .cpuGpu: return "CPU 全部執行緒持續掃描＋GPU Metal kernel 同時讀取，合計最接近整機 DRAM 實際上限"
+        case .read:  return L.t("每個執行緒依序讀取自己那片記憶體（8 路展開 uint64 累加，提高在途請求數）",
+                                "Each thread scans its own buffer sequentially (8-way unrolled uint64 accumulation to raise outstanding requests)")
+        case .write: return L.t("每個執行緒填滿自己那片記憶體（8 路展開寫入）",
+                                "Each thread fills its own buffer (8-way unrolled stores)")
+        case .writePingPong: return L.t("每次迭代交替寫入兩塊 buffer，強迫上一輪的髒資料在本輪逐出，更貼近真實 DRAM 寫入頻寬",
+                                "Alternates two buffers each iteration so the previous round's dirty lines must be evicted this round, closer to sustained DRAM write bandwidth")
+        case .copy:  return L.t("memcpy：src → dst，流量計入讀＋寫雙向位元組",
+                                "memcpy src to dst; traffic counts both read and write bytes")
+        case .cpuGpu: return L.t("CPU 全部執行緒持續掃描＋GPU Metal kernel 同時讀取，合計最接近整機 DRAM 實際上限",
+                                 "All CPU threads scan while a Metal kernel reads concurrently; the total is closest to the SoC's real DRAM ceiling")
         }
     }
 }
@@ -151,7 +206,7 @@ final class Runner: ObservableObject {
     @Published var results: [BenchResult] = []
     @Published var progressDone = 0
     @Published var progressTotal = 1
-    @Published var statusText = "尚未測試"
+    @Published var statusText = L.t("尚未測試", "Not tested yet")
     @Published var errorMessage: String?
     @Published private(set) var lastRun: RunSnapshot?
 
@@ -190,7 +245,7 @@ final class Runner: ObservableObject {
         stateLock.lock()
         cancelRequested = true
         stateLock.unlock()
-        statusText = "正在停止…"
+        statusText = L.t("正在停止…", "Stopping…")
     }
 
     // MARK: 執行流程
@@ -204,7 +259,7 @@ final class Runner: ObservableObject {
         errorMessage = nil
         progressTotal = max(1, modes.count * iterations)
         progressDone = 0
-        statusText = "配置記憶體…"
+        statusText = L.t("配置記憶體…", "Allocating memory…")
         lastRun = RunSnapshot(sizeMB: sizeMB, threads: threads, iterations: iterations, startedAt: Date())
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
@@ -224,14 +279,15 @@ final class Runner: ObservableObject {
                 if let p = rawSrc { free(p) }
                 if let p = rawDst { free(p) }
                 DispatchQueue.main.async {
-                    self.errorMessage = "無法配置 \(sizeMB) MB ×2 的測試緩衝區，請選擇較小的尺寸。"
+                    self.errorMessage = L.t("無法配置 \(sizeMB) MB ×2 的測試緩衝區，請選擇較小的尺寸。",
+                                  "Failed to allocate \(sizeMB) MB x2 test buffers. Please choose a smaller size.")
                 }
                 return
             }
             defer { free(srcRaw); free(dstRaw) }
 
             // 首次觸碰（first-touch）讓分頁實際配置，不計入計時
-            DispatchQueue.main.async { self.statusText = "暖機中…" }
+            DispatchQueue.main.async { self.statusText = L.t("暖機中…", "Warming up…") }
             memset(srcRaw, 0xAB, bytes)
             memset(dstRaw, 0xCD, bytes)
 
@@ -264,7 +320,7 @@ final class Runner: ObservableObject {
         for it in 1...iterations {
             if isCancelled { break }
             let index = it
-            DispatchQueue.main.async { self.statusText = "\(mode.rawValue) 第 \(index)/\(iterations) 次…" }
+            DispatchQueue.main.async { self.statusText = L.pass(index, iterations, mode.display) }
             let secs = Runner.measure(mode: mode, src: src, dst: dst, words: words,
                                       threads: threads, alt: it % 2 == 0)
             let moved = mode == .copy ? Double(bytes) * 2 : Double(bytes)
@@ -285,7 +341,8 @@ final class Runner: ObservableObject {
                                threads: Int, iterations: Int) {
         guard setupGPUBuffers(bytes: bytes) else {
             DispatchQueue.main.async {
-                self.errorMessage = "Metal 初始化或 GPU 緩衝區配置失敗，已跳過 CPU+GPU 併發測試。"
+                self.errorMessage = L.t("Metal 初始化或 GPU 緩衝區配置失敗，已跳過 CPU+GPU 併發測試。",
+                                  "Metal initialization or GPU buffer allocation failed; the CPU+GPU concurrent test was skipped.")
                 self.progressDone += iterations
             }
             return
@@ -299,7 +356,7 @@ final class Runner: ObservableObject {
         for it in 1...iterations {
             if isCancelled { break }
             let index = it
-            DispatchQueue.main.async { self.statusText = "CPU+GPU 併發 第 \(index)/\(iterations) 次…" }
+            DispatchQueue.main.async { self.statusText = L.pass(index, iterations, TestMode.cpuGpu.display) }
             let r = measureCPUGPU(src: src, words: words, threads: threads)
             totals.append(r.total); cpuPart.append(r.cpu); gpuPart.append(r.gpu)
             msList.append(r.secs * 1000)
@@ -326,7 +383,7 @@ final class Runner: ObservableObject {
                 self.activityToken = nil
             }
             self.running = false
-            self.statusText = cancelled ? "已停止" : "完成"
+            self.statusText = cancelled ? L.t("已停止", "Stopped") : L.t("完成", "Done")
         }
     }
 
@@ -573,7 +630,7 @@ struct ContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if let spec = currentChipSpec {
-                Text("原廠規格：記憶體頻寬 \(spec.officialText)（LPDDR 匯流排理論峰值，實測通常約 50–80%）")
+                Text(L.t("原廠規格：記憶體頻寬 \(spec.officialDisplay)（LPDDR 匯流排理論峰值，實測通常約 50–80%）", "Official spec memory bandwidth: \(spec.officialDisplay) (theoretical LPDDR bus peak; real-world results are typically 50–80%)"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -583,7 +640,7 @@ struct ContentView: View {
     private var controls: some View {
         Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 12) {
             GridRow {
-                Text("緩衝區大小")
+                Text(L.t("緩衝區大小", "Buffer size"))
                 Picker("", selection: $sizeMB) {
                     ForEach(sizeOptions, id: \.self) { Text("\($0) MB").tag($0) }
                 }
@@ -591,28 +648,28 @@ struct ContentView: View {
                 .labelsHidden()
                 .fixedSize()
                 .disabled(runner.running)
-                .help("小尺寸（16／64 MB）會被 L2 快取吸收，數字會明顯高於真實 DRAM 頻寬；量測 DRAM 請用 256 MB 以上")
+                .help(L.t("小尺寸（16／64 MB）會被 L2 快取吸收，數字會明顯高於真實 DRAM 頻寬；量測 DRAM 請用 256 MB 以上", "Small sizes (16/64 MB) get absorbed by the L2 cache and read far above real DRAM bandwidth; use 256 MB or more to measure DRAM"))
             }
             GridRow {
-                Text("執行緒數")
+                Text(L.t("執行緒數", "Threads"))
                 Stepper(value: $threads, in: 1...max(1, logicalCores)) {
                     Text("\(threads)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
                 }
                 .disabled(runner.running)
             }
             GridRow {
-                Text("每項迭代")
+                Text(L.t("每項迭代", "Iterations"))
                 Stepper(value: $iterations, in: 1...20) {
                     Text("\(iterations)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
                 }
                 .disabled(runner.running)
             }
             GridRow {
-                Text("測試項目")
+                Text(L.t("測試項目", "Tests"))
                 HStack(spacing: 16) {
                     ForEach(TestMode.allCases) { mode in
                         Toggle(isOn: binding(for: mode)) {
-                            Text(mode.rawValue).help(mode.detail)
+                            Text(mode.display).help(mode.detail)
                         }
                         .toggleStyle(.checkbox)
                     }
@@ -621,14 +678,14 @@ struct ContentView: View {
             }
             GridRow {
                 HStack(spacing: 12) {
-                    Button(runner.running ? "測試中…" : "開始測試") { start() }
+                    Button(runner.running ? L.t("測試中…", "Testing…") : L.t("開始測試", "Start Test")) { start() }
                         .keyboardShortcut(.defaultAction)
                         .disabled(runner.running || selectedModes.isEmpty)
 
-                    Button("停止") { runner.cancel() }
+                    Button(L.t("停止", "Stop")) { runner.cancel() }
                         .disabled(!runner.running)
 
-                    Button("匯出 CSV") { exportCSV() }
+                    Button(L.t("匯出 CSV", "Export CSV")) { exportCSV() }
                         .disabled(runner.results.isEmpty)
                 }
                 Text(runner.statusText)
@@ -641,7 +698,7 @@ struct ContentView: View {
     private func start() {
         let modes = TestMode.allCases.filter { selectedModes.contains($0) }
         guard !modes.isEmpty else {
-            runner.errorMessage = "請至少選擇一種測試項目。"
+            runner.errorMessage = L.t("請至少選擇一種測試項目。", "Please select at least one test.")
             return
         }
         runner.errorMessage = nil
@@ -664,7 +721,7 @@ struct ContentView: View {
                 Image(systemName: "memorychip")
                     .font(.system(size: 42))
                     .foregroundStyle(.tertiary)
-                Text("設定好參數後按「開始測試」")
+                Text(L.t("設定好參數後按「開始測試」", "Configure the options and press Start Test"))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -673,7 +730,7 @@ struct ContentView: View {
                 Chart {
                     ForEach(runner.results) { r in
                         BarMark(
-                            x: .value("測試", r.mode.rawValue),
+                            x: .value(L.t("測試", "Test"), r.mode.display),
                             y: .value("GB/s", r.avgGBps)
                         )
                         .annotation(position: .top) {
@@ -683,11 +740,11 @@ struct ContentView: View {
                         }
                     }
                     if let spec = currentChipSpec {
-                        RuleMark(y: .value("原廠", spec.baselineGBps))
+                        RuleMark(y: .value(L.t("原廠", "Official"), spec.baselineGBps))
                             .foregroundStyle(.orange)
                             .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [6, 3]))
                             .annotation(position: .top, alignment: .trailing) {
-                                Text("原廠 \(spec.officialText)")
+                                Text(L.t("原廠", "Official") + " " + spec.officialDisplay)
                                     .font(.caption2)
                                     .foregroundStyle(.orange)
                             }
@@ -699,10 +756,10 @@ struct ContentView: View {
                 .frame(height: 180)
 
                 Table(runner.results) {
-                    TableColumn("測試項目") { Text($0.mode.rawValue) }
-                    TableColumn("平均 GB/s") { Text(String(format: "%.1f", $0.avgGBps)).monospacedDigit() }
-                    TableColumn("峰值 GB/s") { Text(String(format: "%.1f", $0.peakGBps)).monospacedDigit() }
-                    TableColumn("達原廠 %") { r in
+                    TableColumn(L.t("測試項目", "Test")) { Text($0.mode.display) }
+                    TableColumn(L.t("平均 GB/s", "Avg GB/s")) { Text(String(format: "%.1f", $0.avgGBps)).monospacedDigit() }
+                    TableColumn(L.t("峰值 GB/s", "Peak GB/s")) { Text(String(format: "%.1f", $0.peakGBps)).monospacedDigit() }
+                    TableColumn(L.t("達原廠 %", "% of Official")) { r in
                         if let spec = currentChipSpec {
                             Text(String(format: "%.0f%%", r.avgGBps / spec.baselineGBps * 100)).monospacedDigit()
                                 .foregroundStyle(r.avgGBps / spec.baselineGBps >= 0.75 ? .green : .secondary)
@@ -710,10 +767,10 @@ struct ContentView: View {
                             Text("—").foregroundStyle(.tertiary)
                         }
                     }
-                    TableColumn("平均耗時 ms") { Text(String(format: "%.1f", $0.avgMs)).monospacedDigit() }
-                    TableColumn("CPU／GPU 分項") { r in
+                    TableColumn(L.t("平均耗時 ms", "Avg Time ms")) { Text(String(format: "%.1f", $0.avgMs)).monospacedDigit() }
+                    TableColumn(L.t("CPU／GPU 分項", "CPU/GPU Breakdown")) { r in
                         if let c = r.cpuGBps, let g = r.gpuGBps {
-                            Text(String(format: "CPU %.1f ＋ GPU %.1f", c, g)).monospacedDigit()
+                            Text(L.lang == .en ? String(format: "CPU %.1f + GPU %.1f", c, g) : String(format: "CPU %.1f ＋ GPU %.1f", c, g)).monospacedDigit()
                         } else {
                             Text("—").foregroundStyle(.tertiary)
                         }
@@ -748,7 +805,7 @@ struct ContentView: View {
 @main
 struct MemoryBandwidthBenchApp: App {
     var body: some Scene {
-        WindowGroup("Memory Bandwidth Bench") {
+        WindowGroup(L.t("記憶體頻寬測試", "Memory Bandwidth Bench")) {
             ContentView()
         }
     }
