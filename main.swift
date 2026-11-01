@@ -207,6 +207,7 @@ enum TestMode: String, CaseIterable, Identifiable {
     case writePingPong = "write-pingpong"
     case copy = "copy"
     case cpuGpu = "cpu+gpu"
+    case gpuOnly = "gpu-only"
     var id: String { rawValue }   // stable English key (CSV / debugging)
 
     var display: String {
@@ -216,6 +217,7 @@ enum TestMode: String, CaseIterable, Identifiable {
         case .writePingPong: return L.t("寫入(乒乓)", "Write (ping-pong)")
         case .copy:  return L.t("複製", "Copy")
         case .cpuGpu: return L.t("CPU+GPU併發", "CPU+GPU concurrent")
+        case .gpuOnly: return L.t("純 GPU", "GPU-only")
         }
     }
 
@@ -231,6 +233,8 @@ enum TestMode: String, CaseIterable, Identifiable {
                                 "memcpy src to dst; traffic counts both read and write bytes")
         case .cpuGpu: return L.t("CPU 全部執行緒持續掃描＋GPU Metal kernel 同時讀取，合計最接近整機 DRAM 實際上限",
                                  "All CPU threads scan while a Metal kernel reads concurrently; the total is closest to the SoC's real DRAM ceiling")
+        case .gpuOnly: return L.t("GPU 單獨全力讀取，多組命令緩衝輪替保持佇列滿載；不夾 CPU 流量，量單一主控端能吃到的上限",
+                                 "GPU reads at full throttle with pipelined command buffers keeping the queue saturated; no CPU traffic, measures what the GPU alone can pull")
         }
     }
 }
@@ -310,7 +314,7 @@ final class Runner: ObservableObject {
         running = true
         results = []
         errorMessage = nil
-        progressTotal = max(1, modes.reduce(0) { $0 + ($1 == .cpuGpu ? iterations * 8 : iterations) })
+        progressTotal = max(1, modes.reduce(0) { $0 + (($1 == .cpuGpu || $1 == .gpuOnly) ? iterations * 8 : iterations) })
         progressDone = 0
         statusText = L.t("配置記憶體…", "Allocating memory…")
         lastRun = RunSnapshot(sizeMB: sizeMB, threads: threads, iterations: iterations, startedAt: Date())
@@ -348,7 +352,7 @@ final class Runner: ObservableObject {
             let dst = dstRaw.assumingMemoryBound(to: UInt64.self)
             let words = bytes / MemoryLayout<UInt64>.size
 
-            for mode in modes where mode != .cpuGpu {
+            for mode in modes where mode != .cpuGpu && mode != .gpuOnly {
                 if self.isCancelled { break }
                 self.runCPUMode(mode: mode, src: src, dst: dst, bytes: bytes,
                                 words: words, threads: threads, iterations: iterations)
@@ -357,6 +361,10 @@ final class Runner: ObservableObject {
             if modes.contains(.cpuGpu), !self.isCancelled {
                 self.runCPUPlusGPU(src: src, words: words, bytes: bytes,
                                    threads: threads, iterations: iterations)
+            }
+
+            if modes.contains(.gpuOnly), !self.isCancelled {
+                self.runGPUOnly(bytes: bytes, iterations: iterations)
             }
         }
     }
@@ -427,6 +435,74 @@ final class Runner: ObservableObject {
         }
     }
 
+    private func runGPUOnly(bytes: Int, iterations: Int) {
+        guard setupGPUBuffers(bytes: bytes) else {
+            DispatchQueue.main.async {
+                self.errorMessage = L.t("Metal 初始化或 GPU 緩衝區配置失敗，已跳過純 GPU 測試。",
+                                  "Metal initialization or GPU buffer allocation failed; the GPU-only test was skipped.")
+                self.progressDone += iterations * 8
+            }
+            return
+        }
+        _ = measureGPUOnly(windowSecs: 0.25)   // warm-up
+
+        var gbps: [Double] = []
+        for it in 1...iterations {
+            if isCancelled { break }
+            let index = it
+            DispatchQueue.main.async { self.statusText = L.pass(index, iterations, TestMode.gpuOnly.display) }
+            guard let g = measureGPUOnly() else { break }
+            gbps.append(g)
+            DispatchQueue.main.async { self.progressDone += 8 }
+        }
+        guard !gbps.isEmpty else { return }
+        let avg = gbps.reduce(0, +) / Double(gbps.count)
+        let peak = gbps.max() ?? 0
+        DispatchQueue.main.async {
+            self.results.append(BenchResult(mode: .gpuOnly, avgGBps: avg, peakGBps: peak, avgMs: 500))
+        }
+    }
+
+    /// GPU-only full-throttle reads: several command buffers stay in flight so the GPU
+    /// queue never drains between bursts; no CPU traffic competes for the bus.
+    private func measureGPUOnly(windowSecs: Double = 0.5) -> Double? {
+        guard let queue = mtlQueue, let pso = gpuPso,
+              let buf = gpuBuf, let out = gpuOutBuf else { return nil }
+        var count = UInt32(buf.length / 16)   // float4 = 16 bytes
+        let passesPerBurst = 8
+        let inflightLimit = 4
+        let bytesPerBurst = Double(buf.length) * Double(passesPerBurst)
+        func commitBurst() -> MTLCommandBuffer? {
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return nil }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(buf, offset: 0, index: 0)
+            enc.setBuffer(out, offset: 0, index: 1)
+            enc.setBytes(&count, length: 4, index: 2)
+            for _ in 0..<passesPerBurst {
+                enc.dispatchThreads(MTLSize(width: gpuThreads, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
+            enc.endEncoding()
+            cb.commit()
+            return cb
+        }
+        var totalBytes = 0.0
+        var ring: [MTLCommandBuffer] = []
+        let t0 = nowNs()
+        while nsToSec(nowNs() - t0) < windowSecs {
+            guard let cb = commitBurst() else { break }
+            ring.append(cb)
+            totalBytes += bytesPerBurst
+            if ring.count >= inflightLimit {
+                ring.removeFirst().waitUntilCompleted()
+            }
+        }
+        for cb in ring { cb.waitUntilCompleted() }
+        let win = max(nsToSec(nowNs() - t0), 0.001)
+        return totalBytes / win / 1e9
+    }
+
     /// Single exit path: guarantees the power assertion is released (alloc failure, cancel, etc.)
     private func finishRun() {
         let cancelled = isCancelled
@@ -466,8 +542,8 @@ final class Runner: ObservableObject {
         let chunk = max(64, (words / threads) & ~63)   // align to 512 bytes
         let t0 = nowNs()
         switch mode {
-        case .cpuGpu:
-            return 0   // concurrent mode uses measureCPUGPU; unreachable here
+        case .cpuGpu, .gpuOnly:
+            return 0   // cpuGpu/gpuOnly use their own paths; unreachable here
         case .read:
             var sums = [UInt64](repeating: 0, count: threads)
             DispatchQueue.concurrentPerform(iterations: threads) { i in
@@ -666,6 +742,9 @@ extension Runner {
         if setupGPUBuffers(bytes: bytes) {
             let r = measureCPUGPU(src: src, words: words, threads: threads)
             lines.append("{\"mode\":\"cpu+gpu\",\"gbps\":\(String(format: "%.2f", r.total))}")
+            if let g = measureGPUOnly(windowSecs: 0.25) {
+                lines.append("{\"mode\":\"gpu-only\",\"gbps\":\(String(format: "%.2f", g))}")
+            }
         }
         return lines
     }

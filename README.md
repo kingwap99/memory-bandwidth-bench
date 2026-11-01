@@ -30,6 +30,7 @@ The git tag is the single source of truth. One command bumps the version, rebuil
 | Write (ping-pong) | Alternates two buffers each iteration so dirty lines must be evicted, closer to sustained DRAM write bandwidth |
 | Copy | memcpy; traffic counts both read and write bytes |
 | CPU+GPU concurrent | All CPU threads scan while a Metal kernel reads at the same time; the total is closest to the SoC ceiling |
+| GPU-only | A Metal kernel reads at full throttle with pipelined command buffers; a single master pushing the bus near saturation |
 
 ## Official spec baseline
 
@@ -82,6 +83,7 @@ The UI detects the system language at launch: Traditional Chinese (zh-Hant), Sim
 | 寫入(乒乓) | 每次迭代交替寫兩塊 buffer，強迫上一輪髒資料在本輪逐出，較貼近 DRAM 持續寫入 |
 | 複製 | memcpy，流量計入讀＋寫雙向位元組 |
 | CPU+GPU併發 | CPU 全執行緒掃描的同時，Metal kernel 讓 GPU 一起讀取；合計值最接近整機上限 |
+| 純 GPU | Metal kernel 單獨全力讀取，命令緩衝輪替滿載；單一主控端就能把匯流排推到接近飽和 |
 
 ### 原廠規格對照
 
