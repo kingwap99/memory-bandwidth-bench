@@ -37,6 +37,8 @@ let versionString: String = {
 var issuer = ""
 var dryRun = false
 var privateKey: P256.Signing.PrivateKey?
+var agreementRetries = 0
+let agreementRetryLimit = 15
 
 // MARK: - Logging
 
@@ -100,6 +102,17 @@ func api(_ method: String, _ path: String, body: [String: Any]? = nil) throws ->
     }.resume()
     sem.wait()
     guard (200..<300).contains(status) else {
+        // Apple enables the endpoints right after the agreement is accepted, but
+        // the rollout is not simultaneous. Wait and retry.
+        if text.contains("REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED") {
+            if agreementRetries < agreementRetryLimit {
+                agreementRetries += 1
+                log("endpoint \(path) not enabled yet; waiting 20s (\(agreementRetries)/\(agreementRetryLimit))")
+                Thread.sleep(forTimeInterval: 20)
+                agreementRetries = 0
+                return try api(method, path, body: body)
+            }
+        }
         throw APIError(status: status, body: text)
     }
     if let data = text.data(using: .utf8),
@@ -164,8 +177,8 @@ func ensureBundleId() throws -> String {
             "attributes": [
                 "name": appName,
                 "identifier": bundleID,
-                "platform": "OSX",
-                "seedId": UUID().uuidString,
+                "platform": "MAC_OS",
+                "seedId": teamID,
             ],
         ],
     ]
@@ -203,25 +216,28 @@ func existingDistributionIdentity() -> String? {
 func sha1Hex(_ der: Data) -> String {
     var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
     der.withUnsafeBytes { raw in
-        _ = CC_SHA1(raw.baseAddress, CC_LONG(CC_SHA1_DIGEST_LENGTH), &digest)
+        _ = CC_SHA1(raw.baseAddress, CC_LONG(der.count), &digest)
     }
     return digest.map { String(format: "%02X", $0) }.joined()
 }
 
-func ensureDistributionCertificate() throws -> (identity: String, certificateID: String) {
-    if let identity = existingDistributionIdentity() {
-        for cert in try apiAll("/v1/certificates?filter%5BcertificateType%5D=APPLE_DISTRIBUTION") {
-            guard let attrs = cert["attributes"] as? [String: Any],
-                  let b64 = attrs["certificateContent"] as? String,
-                  let der = Data(base64Encoded: b64) else { continue }
-            if sha1Hex(der) == identity {
-                log("using existing signing identity \(identity)")
-                return (identity, cert["id"] as? String ?? "")
-            }
-        }
-        fail("keychain identity \(identity) has no matching App Store Connect certificate")
+func ensureDistributionCertificate() throws -> (identity: String, certificateID: String, keychain: String) {
+    try? FileManager.default.createDirectory(at: p12Store, withIntermediateDirectories: true)
+    // Reuse a certificate whose private key we still hold, so repeat runs do not
+    // ask Apple for a new certificate every time.
+    for cert in try apiAll("/v1/certificates") {
+        let attrs = cert["attributes"] as? [String: Any] ?? [:]
+        let type = attrs["certificateType"] as? String ?? ""
+        guard type == "DISTRIBUTION" || type == "MAC_APP_DISTRIBUTION" else { continue }
+        let id = cert["id"] as? String ?? ""
+        guard let b64 = attrs["certificateContent"] as? String,
+              let der = Data(base64Encoded: b64) else { continue }
+        let stored = p12Store.appendingPathComponent("\(id).p12")
+        guard FileManager.default.fileExists(atPath: stored.path) else { continue }
+        log("reusing certificate \(id) (private key kept in ~/.appstoreconnect/signing)")
+        return (sha1Hex(der), id, try makeSigningKeychain(p12: stored))
     }
-    log("no Apple Distribution identity in the keychain; requesting one")
+    log("requesting a new Apple Distribution certificate")
     try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
     let keyPath = workDir.appendingPathComponent("dist.key")
     let csrPath = workDir.appendingPathComponent("dist.csr")
@@ -229,15 +245,15 @@ func ensureDistributionCertificate() throws -> (identity: String, certificateID:
     try run("/usr/bin/openssl", ["req", "-new", "-newkey", "rsa:2048", "-nodes",
                                  "-keyout", keyPath.path, "-out", csrPath.path,
                                  "-subj", subject], label: "openssl req")
-    let csrDer = try run("/usr/bin/openssl", ["req", "-in", csrPath.path, "-outform", "DER"],
-                          label: "openssl csr")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let csrData = Data(base64Encoded: csrDer) else { fail("cannot decode CSR") }
+    let derPath = workDir.appendingPathComponent("dist.csr.der")
+    try run("/usr/bin/openssl", ["req", "-in", csrPath.path, "-outform", "DER", "-out", derPath.path],
+            label: "openssl csr")
+    guard let csrData = try? Data(contentsOf: derPath) else { fail("cannot read the CSR") }
     let body: [String: Any] = [
         "data": [
             "type": "certificates",
             "attributes": [
-                "certificateType": "APPLE_DISTRIBUTION",
+                "certificateType": "MAC_APP_DISTRIBUTION",
                 "csrContent": csrData.base64EncodedString(),
             ],
         ],
@@ -258,28 +274,67 @@ func ensureDistributionCertificate() throws -> (identity: String, certificateID:
     try run("/usr/bin/openssl", ["pkcs12", "-export", "-out", p12Path.path,
                                  "-inkey", keyPath.path, "-in", pemPath.path,
                                  "-passout", "pass:mbbappstore"], label: "openssl pkcs12")
-    try run("/usr/bin/security", ["import", p12Path.path,
-                                 "-k", NSHomeDirectory() + "/Library/Keychains/login.keychain-db",
-                                 "-P", "mbbappstore", "-T", "/usr/bin/codesign",
-                                 "-A"], label: "security import")
-    log("imported Apple Distribution certificate (\(certID))")
-    guard let identity = existingDistributionIdentity() else {
-        fail("certificate imported but no codesigning identity found")
-    }
-    return (identity, certID)
+    try FileManager.default.copyItem(at: p12Path,
+                                      to: p12Store.appendingPathComponent("\(certID).p12"))
+    try ensureIntermediateCertificate()
+    let keychain = try makeSigningKeychain(p12: p12Path)
+    let identity = sha1Hex(certDER)
+    log("imported Apple Distribution certificate \(certID) into a temporary keychain")
+    return (identity, certID, keychain)
 }
 
 // MARK: - Step 3: App Store provisioning profile
 
+/// Persistent home for the certificate private keys.
+var p12Store: URL {
+    URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".appstoreconnect/signing")
+}
+
+/// macOS no longer ships the "Apple Worldwide Developer Relations Certification
+/// Authority (G3)" intermediate that developer certificates chain to. Fetch it
+/// from Apple and add it to the login keychain so the chain resolves.
+func ensureIntermediateCertificate() throws {
+    let cert = workDir.appendingPathComponent("AppleWWDRCAG3.cer")
+    if !FileManager.default.fileExists(atPath: cert.path) {
+        try run("/usr/bin/curl", ["-fsSL", "-o", cert.path,
+                                  "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer"],
+                label: "download WWDR G3")
+    }
+    let dest = NSHomeDirectory() + "/Library/Keychains/login.keychain-db"
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    process.arguments = ["add-certificates", "-k", dest, cert.path]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try? process.run()
+    process.waitUntilExit()
+    log("ensured the Apple WWDR G3 intermediate is in the login keychain")
+}
+
+/// Builds a throwaway keychain holding only the signing key, so codesign never
+/// has to ask for keychain authorisation.
+func makeSigningKeychain(p12: URL) throws -> String {
+    let password = "mbbappstore"
+    let keychain = workDir.appendingPathComponent("signing.keychain-db").path
+    try? FileManager.default.removeItem(atPath: keychain)
+    try run("/usr/bin/security", ["create-keychain", "-p", password, keychain], label: "create-keychain")
+    try run("/usr/bin/security", ["unlock-keychain", "-p", password, keychain], label: "unlock-keychain")
+    try run("/usr/bin/security", ["import", p12.path, "-k", keychain, "-P", "mbbappstore",
+                                  "-T", "/usr/bin/codesign", "-A"], label: "security import")
+    try run("/usr/bin/security", ["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
+                                  "-s", "-k", password, keychain], label: "set-key-partition-list")
+    return keychain
+}
+
 func ensureProfile(bundleIDResourceID: String, certificateID: String) throws -> String {
-    let profiles = try apiAll("/v1/profiles?filter%5BprofileType%5D=APP_STORE")
+    let profiles = try apiAll("/v1/profiles?filter%5BprofileType%5D=MAC_APP_STORE")
     let wanted = "MBB App Store \(bundleID)"
     for profile in profiles {
         let attrs = profile["attributes"] as? [String: Any] ?? [:]
         guard attrs["name"] as? String == wanted else { continue }
         let id = profile["id"] as? String ?? ""
         let existing = apiData(try api("GET", "/v1/profiles/" + id))
-        let profileData = existing["profileContent"] as? String ?? ""
+        let profileData = (existing["attributes"] as? [String: Any])?["profileContent"] as? String ?? ""
         if !profileData.isEmpty {
             let path = workDir.appendingPathComponent("profile.mobileprovision")
             try Data(base64Encoded: profileData)?.write(to: path)
@@ -293,7 +348,7 @@ func ensureProfile(bundleIDResourceID: String, certificateID: String) throws -> 
             "type": "profiles",
             "attributes": [
                 "name": wanted,
-                "profileType": "APP_STORE",
+                "profileType": "MAC_APP_STORE",
             ],
             "relationships": [
                 "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResourceID]],
@@ -326,50 +381,49 @@ func installProfile(_ path: URL) throws {
 
 // MARK: - Step 4: archive and export
 
-func buildSignedPackage(profileName: String) throws -> URL {
-    let archivePath = workDir.appendingPathComponent("MemoryBandwidthBench.xcarchive")
-    let exportDir = workDir.appendingPathComponent("export")
-    try? FileManager.default.createDirectory(at: exportDir, withIntermediateDirectories: true)
-    log("archiving with manual signing (profile: \(profileName))")
+func buildSignedPackage(identity: String, keychain: String) throws -> URL {
+    let derived = workDir.appendingPathComponent("DerivedData")
+    log("building the Release app")
     try run("/usr/bin/xcodebuild", [
         "-project", "MemoryBandwidthBench.xcodeproj",
         "-scheme", "Memory Bandwidth Bench",
         "-configuration", "Release",
-        "-archivePath", archivePath.path,
-        "CODE_SIGN_STYLE=Manual",
-        "CODE_SIGN_IDENTITY=Apple Distribution",
-        "PROVISIONING_PROFILE_SPECIFIER=\(profileName)",
-        "DEVELOPMENT_TEAM=\(teamID)",
-        "archive",
-    ], label: "xcodebuild archive")
-    let options = workDir.appendingPathComponent("export-options.plist")
-    let optionsText = """
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-        <key>method</key><string>app-store-connect</string>
-        <key>signingStyle</key><string>manual</string>
-        <key>teamID</key><string>(teamID)</string>
-        <key>provisioningProfiles</key>
-        <dict><key>(bundleID)</key><string>(profileName)</string></dict>
-    </dict>
-    </plist>
-    """
-    try optionsText.write(to: options, atomically: true, encoding: .utf8)
-    log("exporting the archive as an App Store package")
-    try run("/usr/bin/xcodebuild", [
-        "-exportArchive",
-        "-archivePath", archivePath.path,
-        "-exportPath", exportDir.path,
-        "-exportOptionsPlist", options.path,
-    ], label: "xcodebuild -exportArchive")
-    let items = try FileManager.default.contentsOfDirectory(at: exportDir,
-                                                            includingPropertiesForKeys: nil)
-    guard let pkg = items.first(where: { $0.pathExtension == "pkg" }) else {
-        fail("export produced no .pkg")
+        "-derivedDataPath", derived.path,
+        "CODE_SIGNING_ALLOWED=NO",
+        "CODE_SIGNING_REQUIRED=NO",
+        "build",
+    ], label: "xcodebuild build")
+    let app = derived.appendingPathComponent("Build/Products/Release/MemoryBandwidthBench.app")
+    guard FileManager.default.fileExists(atPath: app.path) else {
+        fail("the build did not produce \(app.path)")
     }
-    log("exported \(pkg.lastPathComponent)")
+    let profile = workDir.appendingPathComponent("profile.mobileprovision")
+    try FileManager.default.copyItem(at: profile,
+                                      to: app.appendingPathComponent("Contents/embedded.provisionprofile"))
+    log("signing with the Apple Distribution certificate")
+    // xcodebuild locks keychains it touches, so unlock ours right before signing.
+    try run("/usr/bin/security", ["unlock-keychain", "-p", "mbbappstore", keychain],
+            label: "unlock signing keychain")
+    try run("/usr/bin/codesign", [
+        "--keychain", keychain,
+        "--force", "--options", "runtime", "--timestamp",
+        "--sign", identity,
+        "--entitlements", "MemoryBandwidthBench.entitlements",
+        app.path,
+    ], label: "codesign")
+    try run("/usr/bin/codesign", ["--verify", "--verbose=2", app.path], label: "codesign --verify")
+    let staging = workDir.appendingPathComponent("pkgroot")
+    try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+    try FileManager.default.copyItem(at: app, to: staging.appendingPathComponent(app.lastPathComponent))
+    let pkg = workDir.appendingPathComponent("MemoryBandwidthBench.pkg")
+    log("packaging the app for App Store Connect")
+    try run("/usr/bin/pkgbuild", [
+        "--root", staging.path,
+        "--identifier", bundleID,
+        "--version", versionString,
+        "--install-location", "/",
+        pkg.path,
+    ], label: "pkgbuild")
     return pkg
 }
 
@@ -398,27 +452,37 @@ func ensureAppRecord() throws -> String {
             ],
         ],
     ]
-    let created = apiData(try api("POST", "/v1/apps", body: body))
+    let created: [String: Any]
+    do {
+        created = apiData(try api("POST", "/v1/apps", body: body))
+    } catch let e as APIError where e.status == 403 {
+        fail("""
+        The App Store Connect API cannot create app records. Create it once in the web UI:
+        App Store Connect > App > 新的 App, with name "\(appName)", bundle id \(bundleID),
+        SKU \(sku) and the Utilities category. Then re-run this command.
+        (API said: \(e.body))
+        """)
+    }
     let id = created["id"] as? String ?? ""
     log("app record created (\(id))")
     return id
 }
 
 func ensureVersion(appID: String, versionString: String) throws -> String {
-    let versions = try apiAll("/v1/appStoreVersions?filter%5Bapp%5D=\(appID)")
+    let versions = try apiAll("/v1/apps/\(appID)/appStoreVersions")
     for version in versions {
         let attrs = version["attributes"] as? [String: Any] ?? [:]
         if attrs["versionString"] as? String == versionString,
-           attrs["platform"] as? String == "OSX" {
+           attrs["platform"] as? String == "MAC_OS" {
             log("App Store version \(versionString) already exists")
             return version["id"] as? String ?? ""
         }
     }
-    log("creating App Store version \(versionString) (OSX)")
+    log("creating App Store version \(versionString) (MAC_OS)")
     let body: [String: Any] = [
         "data": [
             "type": "appStoreVersions",
-            "attributes": ["versionString": versionString, "platform": "OSX"],
+            "attributes": ["versionString": versionString, "platform": "MAC_OS"],
             "relationships": ["app": ["data": ["type": "apps", "id": appID]]],
         ],
     ]
@@ -445,7 +509,13 @@ func uploadBuild(versionID: String, packageURL: URL) throws {
             ],
         ],
     ]
-    let created = apiData(try api("POST", "/v1/appStoreVersions/" + versionID + "/build", body: body))
+    var created: [String: Any]
+    do {
+        created = apiData(try api("POST", "/v1/builds", body: body))
+    } catch let e as APIError where e.status == 404 || e.status == 405 {
+        log("POST /v1/builds unavailable (\(e.status)); using the version-scoped endpoint")
+        created = apiData(try api("POST", "/v1/appStoreVersions/" + versionID + "/build", body: body))
+    }
     let attrs = created["attributes"] as? [String: Any] ?? [:]
     let operations = attrs["uploadOperations"] as? [[String: Any]] ?? []
     guard !operations.isEmpty else { fail("no upload operations returned") }
@@ -480,46 +550,41 @@ func uploadBuild(versionID: String, packageURL: URL) throws {
 
 // MARK: - Main
 
-@main
-struct AppStorePublishTool {
-    static func main() {
-        let args = CommandLine.arguments
-        guard args.count >= 2 else {
-            FileHandle.standardError.write(Data("usage: appstore-publish <issuer-id> [--dry-run]\n".utf8))
-            exit(2)
-        }
-        issuer = args[1]
-        dryRun = args.contains("--dry-run")
-        let keyURL = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".appstoreconnect/private_keys/AuthKey_\(keyID).p8")
-        guard let pem = try? String(contentsOf: keyURL, encoding: .utf8) else {
-            fail("cannot read API key at \(keyURL.path)")
-        }
-        guard let key = try? P256.Signing.PrivateKey(pemRepresentation: pem) else {
-            fail("cannot parse API key")
-        }
-        privateKey = key
-        do {
-            log("publishing \(appName) \(versionString) (\(bundleID))")
-            let bundleResourceID = try ensureBundleId()
-            let cert = try ensureDistributionCertificate()
-            let profileName = try ensureProfile(bundleIDResourceID: bundleResourceID,
-                                                certificateID: cert.certificateID)
-            try installProfile(workDir.appendingPathComponent("profile.mobileprovision"))
-            if dryRun {
-                log("dry run: bundle id, certificate and profile are ready; stopping before build/upload")
-                exit(0)
-            }
-            let pkg = try buildSignedPackage(profileName: profileName)
-            let appID = try ensureAppRecord()
-            let versionID = try ensureVersion(appID: appID, versionString: versionString)
-            try uploadBuild(versionID: versionID, packageURL: pkg)
-            log("published successfully")
-        } catch let e as APIError {
-            FileHandle.standardError.write(Data("[appstore] ERROR \(e.status): \(e.body)\n".utf8))
-            exit(1)
-        } catch {
-            fail("\(error)")
-        }
+let args = CommandLine.arguments
+guard args.count >= 2 else {
+    FileHandle.standardError.write(Data("usage: appstore-publish <issuer-id> [--dry-run]\n".utf8))
+    exit(2)
+}
+issuer = args[1]
+dryRun = args.contains("--dry-run")
+let keyURL = URL(fileURLWithPath: NSHomeDirectory())
+    .appendingPathComponent(".appstoreconnect/private_keys/AuthKey_\(keyID).p8")
+guard let pem = try? String(contentsOf: keyURL, encoding: .utf8) else {
+    fail("cannot read API key at \(keyURL.path)")
+}
+guard let key = try? P256.Signing.PrivateKey(pemRepresentation: pem) else {
+    fail("cannot parse API key")
+}
+privateKey = key
+do {
+    log("publishing \(appName) \(versionString) (\(bundleID))")
+    let bundleResourceID = try ensureBundleId()
+    let cert = try ensureDistributionCertificate()
+    _ = try ensureProfile(bundleIDResourceID: bundleResourceID,
+                          certificateID: cert.certificateID)
+    try installProfile(workDir.appendingPathComponent("profile.mobileprovision"))
+    if dryRun {
+        log("dry run: bundle id, certificate and profile are ready; stopping before build/upload")
+        exit(0)
     }
+    let pkg = try buildSignedPackage(identity: cert.identity, keychain: cert.keychain)
+    let appID = try ensureAppRecord()
+    let versionID = try ensureVersion(appID: appID, versionString: versionString)
+    try uploadBuild(versionID: versionID, packageURL: pkg)
+    log("published successfully")
+} catch let e as APIError {
+    FileHandle.standardError.write(Data("[appstore] ERROR \(e.status): \(e.body)\n".utf8))
+    exit(1)
+} catch {
+    fail("\(error)")
 }
