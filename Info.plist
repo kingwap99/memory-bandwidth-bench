@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>zh_TW</string>
+	<string>en</string>
 	<key>CFBundleDisplayName</key>
 	<string>Memory Bandwidth Bench</string>
 	<key>CFBundleExecutable</key>
@@ -14,8 +14,6 @@
 	<string>local.bench.MemoryBandwidthBench</string>
 	<key>CFBundleLocalizations</key>
 	<array>
-		<string>zh-Hant</string>
-		<string>zh-Hans</string>
 		<string>en</string>
 	</array>
 	<key>CFBundleName</key>
