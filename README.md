@@ -4,6 +4,13 @@
 
 A macOS GUI app that measures real memory bandwidth and compares it against Apple's official spec.
 
+## Interface
+
+The window is split into two panes.
+
+- **Left sidebar** — machine identity and the official spec figure sit in the top bar; below them are the buffer size, thread count and iteration controls, a checklist of the six test modes (each with a one-line explanation of what it does), and the Run / Stop / Export buttons with a live progress bar.
+- **Right pane** — a headline card with the best result and its share of the official spec, a bar chart of every test with an orange dashed baseline for the official figure, and a detailed table (average, peak, % of official, elapsed time, CPU/GPU split).
+
 ## Build & Run
 
     ./build.sh
@@ -47,7 +54,7 @@ The git tag is the single source of truth. One command bumps the version, rebuil
 
 ## Language
 
-The UI is English. The app title always carries the version suffix (e.g. "Memory Bandwidth Bench v1.0.8").
+The UI is English. The app title always carries the version suffix (e.g. "Memory Bandwidth Bench v1.0.9").
 
 ## License
 

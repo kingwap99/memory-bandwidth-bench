@@ -57,6 +57,6 @@ git -c user.name="${GIT_AUTHOR_NAME:-kingwap99}" -c user.email="${GIT_AUTHOR_EMA
 git tag "$TAG"
 git push origin main "refs/tags/$TAG"
 
-gh release create "$TAG" "$DMG" --title "Memory Bandwidth Bench $TAG" --notes "macOS memory bandwidth benchmark. Auto UI language (zh-Hant/zh-Hans/en), official-spec baseline with % of official, GPU-core-count config detection. Ad-hoc signed: right-click > Open on first launch." || gh release upload "$TAG" "$DMG" --clobber
+gh release create "$TAG" "$DMG" --title "Memory Bandwidth Bench $TAG" --notes "macOS memory bandwidth benchmark. Redesigned two-pane UI with a headline result card, per-test bar chart against the official-spec baseline, and a detailed results table. Official-spec baseline with % of official, GPU-core-count config detection. Ad-hoc signed: right-click > Open on first launch." || gh release upload "$TAG" "$DMG" --clobber
 
 echo "==> Released: $TAG (build $BUILD)"

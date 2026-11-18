@@ -29,7 +29,6 @@ func sysctlUInt64(_ name: String) -> UInt64? {
 }
 
 let appVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-let appTitle = "Memory Bandwidth Bench v\(appVersion)"
 
 let machineChip = sysctlString("machdep.cpu.brand_string")
 let machineRAMBytes = sysctlUInt64("hw.memsize") ?? 0
@@ -59,7 +58,7 @@ let gpuCoreCount: Int = {
 
 var coreSummary: String {
     if performanceCores > 0, efficiencyCores > 0 {
-        return "\(performanceCores)P+\(efficiencyCores)E・\(logicalCores) threads"
+        return "\(performanceCores)P+\(efficiencyCores)E · \(logicalCores) threads"
     }
     return "\(logicalCores) threads"
 }
@@ -197,6 +196,42 @@ enum TestMode: String, CaseIterable, Identifiable {
         case .gpuOnly: return "GPU reads at full throttle with pipelined command buffers keeping the queue saturated; no CPU traffic, measures what the GPU alone can pull"
         }
     }
+
+    /// SF Symbol shown next to the mode in the UI.
+    var symbol: String {
+        switch self {
+        case .read:  return "arrow.down.to.line"
+        case .write: return "square.and.pencil"
+        case .writePingPong: return "arrow.left.arrow.right"
+        case .copy:  return "doc.on.doc"
+        case .cpuGpu: return "circle.grid.cross.fill"
+        case .gpuOnly: return "cube.transparent"
+        }
+    }
+
+    /// Compact label used on the chart axis.
+    var shortDisplay: String {
+        switch self {
+        case .read:  return "Read"
+        case .write: return "Write"
+        case .writePingPong: return "Ping-pong"
+        case .copy:  return "Copy"
+        case .cpuGpu: return "CPU+GPU"
+        case .gpuOnly: return "GPU"
+        }
+    }
+
+    /// One-line summary shown under the mode name in the sidebar.
+    var blurb: String {
+        switch self {
+        case .read:  return "Sequential reads, 8-way unrolled"
+        case .write: return "Sequential writes to the buffer"
+        case .writePingPong: return "Alternating buffers, sustained write traffic"
+        case .copy:  return "memcpy; counts both read and write bytes"
+        case .cpuGpu: return "CPU threads and a Metal kernel at once"
+        case .gpuOnly: return "Metal only, pipelined command buffers"
+        }
+    }
 }
 
 struct BenchResult: Identifiable {
@@ -223,7 +258,7 @@ final class Runner: ObservableObject {
     @Published var results: [BenchResult] = []
     @Published var progressDone = 0
     @Published var progressTotal = 1
-    @Published var statusText = "Not tested yet"
+    @Published var statusText = "Ready to benchmark"
     @Published var errorMessage: String?
     @Published private(set) var lastRun: RunSnapshot?
 
@@ -707,6 +742,36 @@ extension Runner {
     }
 }
 
+// MARK: - Visual design
+
+enum Palette {
+    /// Accent used for primary actions and measured throughput.
+    static let accent = Color(red: 0.04, green: 0.52, blue: 1.00)      // #0A84FF
+    static let accentDeep = Color(red: 0.31, green: 0.27, blue: 0.90)   // #4F46E5
+    /// Marks a result that reaches a realistic share of the official spec.
+    static let good = Color(red: 0.06, green: 0.72, blue: 0.51)         // #10B981
+    /// Apple's orange, reserved for the official-spec reference.
+    static let official = Color(red: 1.00, green: 0.58, blue: 0.00)      // #FF9500
+
+    static let barGradient = LinearGradient(
+        colors: [accent, accentDeep],
+        startPoint: .top, endPoint: .bottom)
+}
+
+extension View {
+    /// Rounded panel treatment shared by every card in the window.
+    func panelStyle(cornerRadius: CGFloat = 14) -> some View {
+        background {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+                )
+        }
+    }
+}
+
 // MARK: - UI
 
 struct ContentView: View {
@@ -725,96 +790,278 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
+        VStack(spacing: 0) {
+            topBar
             Divider()
-            controls
+            HStack(spacing: 0) {
+                sidebar
+                    .frame(width: 340)
+                Divider()
+                resultsArea
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 1060, minHeight: 640)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: Top bar
+
+    private var topBar: some View {
+        HStack(spacing: 11) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 32, height: 32)
+                .clipShape(.rect(cornerRadius: 7))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                )
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Memory Bandwidth Bench")
+                    .font(.system(size: 14, weight: .semibold))
+                Text("v\(appVersion)")
+                    .font(.system(size: 11, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            infoPill(icon: "cpu", text: machineChip)
+            infoPill(icon: "memorychip", text: "\(formatGB(machineRAMBytes)) · \(coreSummary)")
+            if let spec = currentChipSpec {
+                officialPill(spec)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+    }
+
+    private func infoPill(icon: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+            Text(text).font(.system(size: 11))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Color.primary.opacity(0.06), in: .capsule)
+        .foregroundStyle(.secondary)
+    }
+
+    private func officialPill(_ spec: ChipSpec) -> some View {
+        HStack(spacing: 6) {
+            Circle().fill(Palette.official).frame(width: 6, height: 6)
+            Text("Official \(spec.officialDisplay)")
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Palette.official.opacity(0.13), in: .capsule)
+        .foregroundStyle(Palette.official)
+        .help("Apple's published memory bandwidth for this chip. It is the theoretical LPDDR bus peak, so measured results normally land at 50-80% of it.")
+    }
+
+    // MARK: Sidebar
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    configPanel
+                    modesPanel
+                }
+                .padding(13)
+            }
+            Divider()
+            actionBar
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var configPanel: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            panelHeader("Configuration", icon: "slider.horizontal.3")
+
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel("Buffer size")
+                Picker("", selection: $sizeMB) {
+                    ForEach(sizeOptions, id: \.self) { Text(sizeLabel($0)).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(runner.running)
+                .help("Small buffers (16/64 MB) are absorbed by the cache and read far above real DRAM bandwidth. Use 256 MB or more to measure DRAM.")
+            }
+
+            stepperRow(title: "Threads", unit: "threads",
+                       value: $threads, range: 1...max(1, logicalCores),
+                       hint: "CPU threads used by the CPU-side tests. Every logical core is the usual choice.")
+            stepperRow(title: "Iterations", unit: "passes",
+                       value: $iterations, range: 1...20,
+                       hint: "How many times each test repeats. The average across all passes is reported.")
+        }
+        .padding(13)
+        .panelStyle()
+    }
+
+    private var modesPanel: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                panelHeader("Test modes", icon: "checklist")
+                Spacer()
+                Text("\(selectedModes.count) of \(TestMode.allCases.count)")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            VStack(spacing: 2) {
+                ForEach(TestMode.allCases) { mode in
+                    modeRow(mode)
+                }
+            }
+        }
+        .padding(13)
+        .panelStyle()
+    }
+
+    private func modeRow(_ mode: TestMode) -> some View {
+        let on = selectedModes.contains(mode)
+        return Toggle(isOn: binding(for: mode)) {
+            HStack(spacing: 9) {
+                Image(systemName: mode.symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(on ? Palette.accent : Color.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(mode.display)
+                        .font(.system(size: 12.5, weight: .medium))
+                    Text(mode.blurb)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .toggleStyle(.checkbox)
+        .disabled(runner.running)
+        .padding(.vertical, 3)
+        .help(mode.detail)
+    }
+
+    // MARK: Actions
+
+    private var actionBar: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if let err = runner.errorMessage {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    start()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "play.fill")
+                        Text(runner.running ? "Running…" : "Run Benchmark")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(runner.running || selectedModes.isEmpty)
+
+                Button {
+                    runner.cancel()
+                } label: {
+                    Image(systemName: "stop.fill")
+                }
+                .controlSize(.large)
+                .buttonStyle(.bordered)
+                .disabled(!runner.running)
+                .help("Stop the running benchmark")
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    exportCSV()
+                } label: {
+                    Label("Export CSV", systemImage: "square.and.arrow.up")
+                        .font(.caption)
+                }
+                .disabled(runner.results.isEmpty)
+                Spacer()
+                if runner.progressTotal > 1 {
+                    Text("\(min(runner.progressDone, runner.progressTotal)) / \(runner.progressTotal)")
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             if runner.running || runner.progressDone > 0 {
                 ProgressView(value: Double(min(runner.progressDone, runner.progressTotal)),
                              total: Double(runner.progressTotal))
                     .progressViewStyle(.linear)
+                    .tint(Palette.accent)
             }
-            if let err = runner.errorMessage {
-                Text(err).foregroundStyle(.red).font(.callout)
-            }
-            resultsSection
-            Spacer(minLength: 0)
-        }
-        .padding(20)
-        .frame(minWidth: 780, minHeight: 600)
-    }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(appTitle)
-                .font(.title2.weight(.semibold))
-            Text("\(machineChip)・\(formatGB(machineRAMBytes)) RAM・\(coreSummary)")
-                .font(.callout)
+            Text(runner.statusText)
+                .font(.caption)
                 .foregroundStyle(.secondary)
-            if let spec = currentChipSpec {
-                Text("Official spec memory bandwidth: \(spec.officialDisplay) (theoretical LPDDR bus peak; real-world results are typically 50–80%)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(13)
+    }
+
+    // MARK: Small building blocks
+
+    private func panelHeader(_ title: String, icon: String) -> some View {
+        Label {
+            Text(title).font(.system(size: 12, weight: .semibold))
+        } icon: {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Palette.accent)
         }
     }
 
-    private var controls: some View {
-        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 12) {
-            GridRow {
-                Text("Buffer size")
-                Picker("", selection: $sizeMB) {
-                    ForEach(sizeOptions, id: \.self) { Text("\($0) MB").tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
-                .disabled(runner.running)
-                .help("Small sizes (16/64 MB) get absorbed by the L2 cache and read far above real DRAM bandwidth; use 256 MB or more to measure DRAM")
-            }
-            GridRow {
-                Text("Threads")
-                Stepper(value: $threads, in: 1...max(1, logicalCores)) {
-                    Text("\(threads)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
-                }
-                .disabled(runner.running)
-            }
-            GridRow {
-                Text("Iterations")
-                Stepper(value: $iterations, in: 1...20) {
-                    Text("\(iterations)").monospacedDigit().frame(minWidth: 24, alignment: .leading)
-                }
-                .disabled(runner.running)
-            }
-            GridRow {
-                Text("Tests")
-                HStack(spacing: 16) {
-                    ForEach(TestMode.allCases) { mode in
-                        Toggle(isOn: binding(for: mode)) {
-                            Text(mode.display).help(mode.detail)
-                        }
-                        .toggleStyle(.checkbox)
-                    }
-                }
-                .disabled(runner.running)
-            }
-            GridRow {
-                HStack(spacing: 12) {
-                    Button(runner.running ? "Testing…" : "Start Test") { start() }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(runner.running || selectedModes.isEmpty)
+    private func fieldLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.secondary)
+    }
 
-                    Button("Stop") { runner.cancel() }
-                        .disabled(!runner.running)
-
-                    Button("Export CSV") { exportCSV() }
-                        .disabled(runner.results.isEmpty)
+    private func stepperRow(title: String, unit: String, value: Binding<Int>,
+                            range: ClosedRange<Int>, hint: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            fieldLabel(title)
+            Stepper(value: value, in: range) {
+                HStack(spacing: 4) {
+                    Text("\(value.wrappedValue)")
+                        .font(.system(size: 15, weight: .medium))
+                        .monospacedDigit()
+                    Text(unit)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
                 }
-                Text(runner.statusText)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
             }
+            .disabled(runner.running)
         }
+        .help(hint)
+    }
+
+    private func sizeLabel(_ mb: Int) -> String {
+        mb >= 1024 ? "\(mb / 1024) GB" : "\(mb) MB"
     }
 
     private func start() {
@@ -837,69 +1084,270 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var resultsSection: some View {
+    private var resultsArea: some View {
         if runner.results.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "memorychip")
-                    .font(.system(size: 42))
-                    .foregroundStyle(.tertiary)
-                Text("Configure the options and press Start Test")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            emptyState
         } else {
-            VStack(alignment: .leading, spacing: 12) {
-                Chart {
-                    ForEach(runner.results) { r in
-                        BarMark(
-                            x: .value("Test", r.mode.display),
-                            y: .value("GB/s", r.avgGBps)
-                        )
-                        .annotation(position: .top) {
-                            Text(String(format: "%.1f", r.avgGBps))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    headlineCard
+                    chartCard
+                    tableCard
+                }
+                .padding(13)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "speedometer")
+                .font(.system(size: 46, weight: .light))
+                .foregroundStyle(Palette.accent.gradient)
+            Text(runner.running ? "Benchmark running" : "No measurement yet")
+                .font(.title3.weight(.semibold))
+            Text(emptyStateHint)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 430)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyStateHint: String {
+        var text = "Pick a buffer size, tick the tests you want, then press Run Benchmark."
+        if let spec = currentChipSpec {
+            text += " Results are compared against the \(spec.officialDisplay) figure Apple publishes for this chip."
+        }
+        return text
+    }
+
+    private var headlineCard: some View {
+        HStack(alignment: .center, spacing: 18) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("BEST RESULT")
+                    .font(.system(size: 10, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(String(format: "%.1f", bestResult?.avgGBps ?? 0))
+                        .font(.system(size: 38, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(Palette.accent.gradient)
+                    Text("GB/s")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                if let best = bestResult {
+                    Label {
+                        Text(best.mode.display)
+                    } icon: {
+                        Image(systemName: best.mode.symbol)
                     }
-                    if let spec = currentChipSpec {
-                        RuleMark(y: .value("Official", spec.baselineGBps))
-                            .foregroundStyle(.orange)
-                            .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [6, 3]))
-                            .annotation(position: .top, alignment: .trailing) {
-                                Text("Official" + " " + spec.officialDisplay)
-                                    .font(.caption2)
-                                    .foregroundStyle(.orange)
-                            }
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 210, alignment: .leading)
+
+            Divider().frame(height: 56)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("Share of the official spec")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%.0f%%", bestRatio * 100))
+                        .font(.callout.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(bestRatio >= 0.75 ? Palette.good : Color.secondary)
+                }
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.08))
+                        Capsule().fill(Palette.barGradient)
+                            .frame(width: max(3, geo.size.width * min(bestRatio, 1)))
                     }
                 }
-                .chartYAxisLabel("GB/s")
-                .chartYScale(domain: 0...(max(runner.results.map { $0.avgGBps }.max() ?? 1,
-                                                  currentChipSpec?.baselineGBps ?? 0) * 1.08))
-                .frame(height: 180)
+                .frame(height: 9)
+                HStack {
+                    Text("0")
+                    Spacer()
+                    Text("\(officialGBpsLabel) official")
+                }
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.tertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(16)
+        .panelStyle()
+    }
 
-                Table(runner.results) {
-                    TableColumn("Test") { Text($0.mode.display) }
-                    TableColumn("Avg GB/s") { Text(String(format: "%.1f", $0.avgGBps)).monospacedDigit() }
-                    TableColumn("Peak GB/s") { Text(String(format: "%.1f", $0.peakGBps)).monospacedDigit() }
-                    TableColumn("% of Official") { r in
-                        if let spec = currentChipSpec, spec.baselineGBps > 0 {
-                            Text(String(format: "%.0f%%", r.avgGBps / spec.baselineGBps * 100)).monospacedDigit()
-                                .foregroundStyle(r.avgGBps / spec.baselineGBps >= 0.75 ? .green : .secondary)
-                        } else {
-                            Text("—").foregroundStyle(.tertiary)
+    private var chartCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                panelHeader("Throughput by test", icon: "chart.bar.fill")
+                Spacer()
+                if currentChipSpec != nil {
+                    HStack(spacing: 6) {
+                        Capsule().fill(Palette.official).frame(width: 16, height: 2)
+                        Text("\(officialGBpsLabel) official")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Chart {
+                ForEach(runner.results) { r in
+                    BarMark(
+                        x: .value("Test", r.mode.shortDisplay),
+                        y: .value("GB/s", r.avgGBps),
+                        width: .fixed(30)
+                    )
+                    .foregroundStyle(Palette.barGradient)
+                    .cornerRadius(6)
+                    .annotation(position: .top, spacing: 3) {
+                        Text(String(format: "%.1f", r.avgGBps))
+                            .font(.system(size: 10.5).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let spec = currentChipSpec {
+                    RuleMark(y: .value("Official spec", spec.baselineGBps))
+                        .foregroundStyle(Palette.official)
+                        .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
+                }
+            }
+            .chartYAxisLabel("GB/s")
+            .chartYScale(domain: 0...chartDomainMax)
+            .chartXAxis {
+                AxisMarks(preset: .aligned, position: .bottom) { value in
+                    AxisValueLabel {
+                        if let name = value.as(String.self) {
+                            Text(name)
+                                .font(.system(size: 10.5))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
                         }
                     }
-                    TableColumn("Avg Time ms") { Text(String(format: "%.1f", $0.avgMs)).monospacedDigit() }
-                    TableColumn("CPU/GPU Breakdown") { r in
-                        if let c = r.cpuGBps, let g = r.gpuGBps {
-                            Text(String(format: "CPU %.1f + GPU %.1f", c, g)).monospacedDigit()
-                        } else {
-                            Text("—").foregroundStyle(.tertiary)
-                        }
-                    }
+                }
+            }
+            .chartPlotStyle { plot in
+                plot.background(Color.primary.opacity(0.035))
+            }
+            .frame(height: 220)
+        }
+        .padding(16)
+        .panelStyle()
+    }
+
+    private var tableCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            panelHeader("Detailed results", icon: "tablecells")
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    tableHeader("Test", width: 158, alignment: .leading)
+                    tableHeader("Avg GB/s", width: 70, alignment: .trailing)
+                    tableHeader("Peak GB/s", width: 70, alignment: .trailing)
+                    tableHeader("% of official", width: 108, alignment: .trailing)
+                    tableHeader("Time ms", width: 62, alignment: .trailing)
+                    tableHeader("CPU / GPU split", width: 122, alignment: .trailing)
+                }
+                .padding(.bottom, 7)
+
+                ForEach(Array(runner.results.enumerated()), id: \.element.id) { index, r in
+                    if index > 0 { Divider() }
+                    resultRow(r)
                 }
             }
         }
+        .padding(16)
+        .panelStyle()
+    }
+
+    private func resultRow(_ r: BenchResult) -> some View {
+        HStack(spacing: 12) {
+            Label {
+                Text(r.mode.display).lineLimit(1)
+            } icon: {
+                Image(systemName: r.mode.symbol).foregroundStyle(Palette.accent)
+            }
+            .frame(width: 158, alignment: .leading)
+
+            Text(String(format: "%.1f", r.avgGBps))
+                .frame(width: 70, alignment: .trailing)
+            Text(String(format: "%.1f", r.peakGBps))
+                .frame(width: 70, alignment: .trailing)
+            percentCell(r)
+                .frame(width: 108, alignment: .trailing)
+            Text(String(format: "%.1f", r.avgMs))
+                .frame(width: 62, alignment: .trailing)
+            Text(breakdownText(r))
+                .foregroundStyle(r.cpuGBps == nil ? Color.secondary.opacity(0.55) : Color.secondary)
+                .frame(width: 122, alignment: .trailing)
+        }
+        .font(.callout)
+        .monospacedDigit()
+        .padding(.vertical, 8)
+    }
+
+    private func percentCell(_ r: BenchResult) -> some View {
+        let ratio = officialRatio(r)
+        let tint: Color = ratio >= 0.75 ? Palette.good : Palette.accent
+        return HStack(spacing: 8) {
+            Text(String(format: "%.0f%%", ratio * 100))
+                .foregroundStyle(ratio >= 0.75 ? Palette.good : Color.secondary)
+                .frame(width: 36, alignment: .trailing)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.08)).frame(width: 60, height: 6)
+                Capsule().fill(tint).frame(width: max(2, 60 * min(ratio, 1)), height: 6)
+            }
+            .frame(width: 60, height: 6)
+        }
+    }
+
+    private func tableHeader(_ title: String, width: CGFloat, alignment: Alignment) -> some View {
+        Text(title)
+            .font(.system(size: 10.5, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: alignment)
+    }
+
+    private func breakdownText(_ r: BenchResult) -> String {
+        if let c = r.cpuGBps, let g = r.gpuGBps {
+            return String(format: "CPU %.1f + GPU %.1f", c, g)
+        }
+        return "—"
+    }
+
+    private var bestResult: BenchResult? {
+        runner.results.max { $0.avgGBps < $1.avgGBps }
+    }
+
+    private func officialRatio(_ r: BenchResult) -> Double {
+        guard let spec = currentChipSpec, spec.baselineGBps > 0 else { return 0 }
+        return r.avgGBps / spec.baselineGBps
+    }
+
+    private var bestRatio: Double {
+        guard let best = bestResult else { return 0 }
+        return officialRatio(best)
+    }
+
+    private var officialGBpsLabel: String {
+        guard let spec = currentChipSpec else { return "—" }
+        return String(format: "%.0f GB/s", spec.baselineGBps)
+    }
+
+    private var chartDomainMax: Double {
+        let measured = runner.results.map { $0.avgGBps }.max() ?? 1
+        let official = currentChipSpec?.baselineGBps ?? 0
+        return max(measured * 1.12, official * 1.04)
     }
 
     private func exportCSV() {
@@ -939,5 +1387,6 @@ struct MemoryBandwidthBenchApp: App {
         WindowGroup("Memory Bandwidth Bench" + " v\(appVersion)") {
             ContentView()
         }
+        .defaultSize(width: 1240, height: 800)
     }
 }

@@ -6,7 +6,8 @@ cd "$(dirname "$0")"
 APP="MemoryBandwidthBench.app"
 
 echo "==> Compiling"
-swiftc -O -parse-as-library main.swift -o MemoryBandwidthBench
+# Deployment target must match LSMinimumSystemVersion in Info.plist (macOS 13).
+swiftc -O -parse-as-library -target "$(uname -m)-apple-macosx13.0" main.swift -o MemoryBandwidthBench
 
 echo "==> Updating app bundle"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
