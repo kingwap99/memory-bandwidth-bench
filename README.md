@@ -16,9 +16,19 @@ The window is split into two panes.
     ./build.sh
     open MemoryBandwidthBench.app
 
-`build.sh` compiles `main.swift`, refreshes the `.app` bundle, and ad-hoc signs it. Requires macOS 13+ and Xcode Command Line Tools.
+`build.sh` compiles `MemoryBandwidthBench.swift`, refreshes the `.app` bundle, and ad-hoc signs it. Requires macOS 13+ and Xcode Command Line Tools.
 
-For a headless smoke test (used by CI): build with `swiftc -O -parse-as-library main.swift -o MemoryBandwidthBench` and run `./MemoryBandwidthBench --self-test`.
+For a headless smoke test (used by CI): build with `swiftc -O -parse-as-library MemoryBandwidthBench.swift -o MemoryBandwidthBench` and run `./MemoryBandwidthBench --self-test`.
+
+## App Store
+
+The app is ready for the Mac App Store: sandboxed entitlements, a privacy manifest, hardened runtime and an Xcode project with automatic signing (`MemoryBandwidthBench.xcodeproj`).
+
+    swift tools/appstore-publish.swift <app-store-connect-issuer-id>
+
+That single command registers the bundle id, creates the "Apple Distribution" certificate and the App Store provisioning profile, archives and exports a signed `.pkg`, creates the App Store Connect app record and version, and uploads the build. The issuer id is the UUID shown in App Store Connect under Users and Access > Integrations > App Store Connect API; it is used with the API key in `~/.appstoreconnect/private_keys/`.
+
+The source `Info.plist` carries the App Store bundle id (`com.kingwap99.MemoryBandwidthBench`); `build.sh` rewrites it to `local.bench.MemoryBandwidthBench` for the local/DMG build so the two never collide.
 
 ## Release
 
@@ -62,10 +72,15 @@ MIT. See [LICENSE](LICENSE).
 
 ## Files
 
-- `main.swift` — all source (UI + measurement core + Metal kernel)
+- `MemoryBandwidthBench.swift` — all source (UI + measurement core + Metal kernel)
+- `MemoryBandwidthBench.xcodeproj` — Xcode project used for the App Store build (automatic signing, hardened runtime)
+- `MemoryBandwidthBench.entitlements` — App Sandbox entitlements
+- `PrivacyInfo.xcprivacy` — privacy manifest
 - `LICENSE` — MIT
 - `build.sh` — build script
 - `make_dmg.sh` — package the DMG (drag-to-install)
 - `release.sh` — version bump + build + DMG + tag + GitHub Release
+- `tools/appstore-publish.swift` — end-to-end App Store Connect publish (bundle id, certificate, profile, build, upload)
+- `tools/asc-api.swift` — generic App Store Connect API client
 - `tools-icon-render.swift` — app icon renderer (CoreGraphics; outputs icons/icon-A/B/C.png)
 - `icons/` — 1024x1024 icon sources (the app uses style C)

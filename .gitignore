@@ -2,6 +2,8 @@
 MemoryBandwidthBench
 MemoryBandwidthBench.app/
 *.dmg
+.build/
+.build-*/
 
 # macOS
 .DS_Store

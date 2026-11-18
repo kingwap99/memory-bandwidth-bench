@@ -11,7 +11,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.bench.MemoryBandwidthBench</string>
+	<string>com.kingwap99.MemoryBandwidthBench</string>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
@@ -28,6 +28,8 @@
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
