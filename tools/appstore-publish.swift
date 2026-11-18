@@ -161,6 +161,21 @@ func run(_ launchPath: String, _ arguments: [String], label: String) throws -> S
     return text
 }
 
+/// Runs a tool without throwing, so callers can inspect partial success.
+func runRaw(_ launchPath: String, _ arguments: [String]) -> (status: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: launchPath)
+    process.arguments = arguments
+    process.currentDirectoryURL = repoRoot
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do { try process.run() } catch { return (1, "\(error)") }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+}
+
 // MARK: - Step 1: bundle id
 
 func ensureBundleId() throws -> String {
@@ -221,23 +236,54 @@ func sha1Hex(_ der: Data) -> String {
     return digest.map { String(format: "%02X", $0) }.joined()
 }
 
-func ensureDistributionCertificate() throws -> (identity: String, certificateID: String, keychain: String) {
+/// Extracts the CN from a DER certificate, which is the name codesign and
+/// Xcode use to refer to the identity.
+func identityDisplayName(_ hash: String, keychain: String) -> String {
+    let out = (try? run("/usr/bin/security", ["find-identity", "-v", keychain],
+                        label: "find-identity")) ?? ""
+    for line in out.split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains(hash) else { continue }
+        if let first = trimmed.firstIndex(of: "\""), let last = trimmed.lastIndex(of: "\""),
+           first < last {
+            return String(trimmed[trimmed.index(after: first)..<last])
+        }
+    }
+    return ""
+}
+
+func certificateCommonName(_ der: Data) -> String {
+    let tmp = workDir.appendingPathComponent("cn-\(UUID().uuidString).cer")
+    guard (try? der.write(to: tmp)) != nil else { return "" }
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let out = (try? run("/usr/bin/openssl", ["x509", "-inform", "DER", "-in", tmp.path,
+                                             "-noout", "-subject", "-nameopt", "RFC2253"],
+                        label: "read certificate subject")) ?? ""
+    for part in out.split(separator: ",") {
+        let piece = part.trimmingCharacters(in: .whitespacesAndNewlines)
+        if piece.hasPrefix("CN=") { return String(piece.dropFirst(3)) }
+    }
+    return ""
+}
+
+func ensureCertificate(types: [String], createType: String, describe: String)
+    throws -> (identity: String, certificateID: String, name: String, p12: URL) {
     try? FileManager.default.createDirectory(at: p12Store, withIntermediateDirectories: true)
     // Reuse a certificate whose private key we still hold, so repeat runs do not
     // ask Apple for a new certificate every time.
     for cert in try apiAll("/v1/certificates") {
         let attrs = cert["attributes"] as? [String: Any] ?? [:]
         let type = attrs["certificateType"] as? String ?? ""
-        guard type == "DISTRIBUTION" || type == "MAC_APP_DISTRIBUTION" else { continue }
+        guard types.contains(type) else { continue }
         let id = cert["id"] as? String ?? ""
         guard let b64 = attrs["certificateContent"] as? String,
               let der = Data(base64Encoded: b64) else { continue }
         let stored = p12Store.appendingPathComponent("\(id).p12")
         guard FileManager.default.fileExists(atPath: stored.path) else { continue }
-        log("reusing certificate \(id) (private key kept in ~/.appstoreconnect/signing)")
-        return (sha1Hex(der), id, try makeSigningKeychain(p12: stored))
+        log("reusing \(describe) certificate \(id)")
+        return (sha1Hex(der), id, certificateCommonName(der), stored)
     }
-    log("requesting a new Apple Distribution certificate")
+    log("requesting a new \(describe) certificate")
     try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
     let keyPath = workDir.appendingPathComponent("dist.key")
     let csrPath = workDir.appendingPathComponent("dist.csr")
@@ -253,7 +299,7 @@ func ensureDistributionCertificate() throws -> (identity: String, certificateID:
         "data": [
             "type": "certificates",
             "attributes": [
-                "certificateType": "MAC_APP_DISTRIBUTION",
+                "certificateType": createType,
                 "csrContent": csrData.base64EncodedString(),
             ],
         ],
@@ -277,10 +323,27 @@ func ensureDistributionCertificate() throws -> (identity: String, certificateID:
     try FileManager.default.copyItem(at: p12Path,
                                       to: p12Store.appendingPathComponent("\(certID).p12"))
     try ensureIntermediateCertificate()
-    let keychain = try makeSigningKeychain(p12: p12Path)
-    let identity = sha1Hex(certDER)
-    log("imported Apple Distribution certificate \(certID) into a temporary keychain")
-    return (identity, certID, keychain)
+    log("created \(describe) certificate \(certID)")
+    return (sha1Hex(certDER), certID, certificateCommonName(certDER), p12Path)
+}
+
+func ensureDistributionCertificate() throws
+    -> (identity: String, certificateID: String, name: String, p12: URL) {
+    // "Apple Distribution" (DISTRIBUTION) is the type a MAC_APP_STORE
+    // provisioning profile accepts.
+    try ensureCertificate(types: ["DISTRIBUTION"],
+                          createType: "DISTRIBUTION",
+                          describe: "Apple Distribution")
+}
+
+/// The .pkg uploaded to App Store Connect must be signed by a separate
+/// "3rd Party Mac Developer Installer" certificate.
+func ensureInstallerCertificate() throws
+    -> (identity: String, certificateID: String, name: String, p12: URL) {
+    let cert = try ensureCertificate(types: ["MAC_INSTALLER_DISTRIBUTION"],
+                                     createType: "MAC_INSTALLER_DISTRIBUTION",
+                                     describe: "Mac Installer Distribution")
+    return (cert.identity, cert.certificateID, cert.name, cert.p12)
 }
 
 // MARK: - Step 3: App Store provisioning profile
@@ -313,34 +376,33 @@ func ensureIntermediateCertificate() throws {
 
 /// Builds a throwaway keychain holding only the signing key, so codesign never
 /// has to ask for keychain authorisation.
-func makeSigningKeychain(p12: URL) throws -> String {
+func makeSigningKeychain(p12s: [URL]) throws -> String {
     let password = "mbbappstore"
     let keychain = workDir.appendingPathComponent("signing.keychain-db").path
     try? FileManager.default.removeItem(atPath: keychain)
     try run("/usr/bin/security", ["create-keychain", "-p", password, keychain], label: "create-keychain")
     try run("/usr/bin/security", ["unlock-keychain", "-p", password, keychain], label: "unlock-keychain")
-    try run("/usr/bin/security", ["import", p12.path, "-k", keychain, "-P", "mbbappstore",
-                                  "-T", "/usr/bin/codesign", "-A"], label: "security import")
+    for p12 in p12s {
+        try run("/usr/bin/security", ["import", p12.path, "-k", keychain, "-P", "mbbappstore",
+                                      "-T", "/usr/bin/codesign", "-T", "/usr/bin/productbuild",
+                                      "-A"], label: "security import")
+    }
     try run("/usr/bin/security", ["set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
                                   "-s", "-k", password, keychain], label: "set-key-partition-list")
     return keychain
 }
 
-func ensureProfile(bundleIDResourceID: String, certificateID: String) throws -> String {
+func ensureProfile(bundleIDResourceID: String, certificateIDs: [String]) throws -> String {
     let profiles = try apiAll("/v1/profiles?filter%5BprofileType%5D=MAC_APP_STORE")
     let wanted = "MBB App Store \(bundleID)"
     for profile in profiles {
         let attrs = profile["attributes"] as? [String: Any] ?? [:]
         guard attrs["name"] as? String == wanted else { continue }
         let id = profile["id"] as? String ?? ""
-        let existing = apiData(try api("GET", "/v1/profiles/" + id))
-        let profileData = (existing["attributes"] as? [String: Any])?["profileContent"] as? String ?? ""
-        if !profileData.isEmpty {
-            let path = workDir.appendingPathComponent("profile.mobileprovision")
-            try Data(base64Encoded: profileData)?.write(to: path)
-            log("reusing provisioning profile \(wanted)")
-            return wanted
-        }
+        // The profile must embed both the application and the installer
+        // certificate, so rebuild it whenever the certificates change.
+        log("replacing the existing provisioning profile")
+        _ = try? api("DELETE", "/v1/profiles/" + id)
     }
     log("creating App Store provisioning profile \(wanted)")
     let body: [String: Any] = [
@@ -352,7 +414,9 @@ func ensureProfile(bundleIDResourceID: String, certificateID: String) throws -> 
             ],
             "relationships": [
                 "bundleId": ["data": ["type": "bundleIds", "id": bundleIDResourceID]],
-                "certificates": ["data": [["type": "certificates", "id": certificateID]]],
+                "certificates": ["data": certificateIDs.map {
+                    ["type": "certificates", "id": $0]
+                }],
             ],
         ],
     ]
@@ -381,7 +445,8 @@ func installProfile(_ path: URL) throws {
 
 // MARK: - Step 4: archive and export
 
-func buildSignedPackage(identity: String, keychain: String) throws -> URL {
+func buildSignedPackage(identity: String, keychain: String, profileName: String,
+                        installerIdentity: String) throws -> URL {
     let derived = workDir.appendingPathComponent("DerivedData")
     log("building the Release app")
     try run("/usr/bin/xcodebuild", [
@@ -397,13 +462,17 @@ func buildSignedPackage(identity: String, keychain: String) throws -> URL {
     guard FileManager.default.fileExists(atPath: app.path) else {
         fail("the build did not produce \(app.path)")
     }
-    let profile = workDir.appendingPathComponent("profile.mobileprovision")
-    try FileManager.default.copyItem(at: profile,
+    try? FileManager.default.removeItem(at: app.appendingPathComponent("Contents/embedded.provisionprofile"))
+    try FileManager.default.copyItem(at: workDir.appendingPathComponent("profile.mobileprovision"),
                                       to: app.appendingPathComponent("Contents/embedded.provisionprofile"))
-    log("signing with the Apple Distribution certificate")
-    // xcodebuild locks keychains it touches, so unlock ours right before signing.
     try run("/usr/bin/security", ["unlock-keychain", "-p", "mbbappstore", keychain],
             label: "unlock signing keychain")
+    let signerName = identityDisplayName(identity, keychain: keychain)
+    let installerName = identityDisplayName(installerIdentity, keychain: keychain)
+    guard !signerName.isEmpty, !installerName.isEmpty else {
+        fail("could not resolve the signing identities in the temporary keychain")
+    }
+    log("signing with \(signerName)")
     try run("/usr/bin/codesign", [
         "--keychain", keychain,
         "--force", "--options", "runtime", "--timestamp",
@@ -412,18 +481,17 @@ func buildSignedPackage(identity: String, keychain: String) throws -> URL {
         app.path,
     ], label: "codesign")
     try run("/usr/bin/codesign", ["--verify", "--verbose=2", app.path], label: "codesign --verify")
-    let staging = workDir.appendingPathComponent("pkgroot")
-    try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-    try FileManager.default.copyItem(at: app, to: staging.appendingPathComponent(app.lastPathComponent))
+    // productbuild --component produces the self-contained product archive the
+    // Mac App Store expects, and signs it with the installer certificate.
+    log("packaging for the Mac App Store")
     let pkg = workDir.appendingPathComponent("MemoryBandwidthBench.pkg")
-    log("packaging the app for App Store Connect")
-    try run("/usr/bin/pkgbuild", [
-        "--root", staging.path,
-        "--identifier", bundleID,
-        "--version", versionString,
-        "--install-location", "/",
+    try run("/usr/bin/productbuild", [
+        "--component", app.path, "/Applications",
+        "--sign", installerName,
+        "--keychain", keychain,
         pkg.path,
-    ], label: "pkgbuild")
+    ], label: "productbuild")
+    log("package created and signed by \(installerName)")
     return pkg
 }
 
@@ -472,10 +540,25 @@ func ensureVersion(appID: String, versionString: String) throws -> String {
     let versions = try apiAll("/v1/apps/\(appID)/appStoreVersions")
     for version in versions {
         let attrs = version["attributes"] as? [String: Any] ?? [:]
-        if attrs["versionString"] as? String == versionString,
-           attrs["platform"] as? String == "MAC_OS" {
+        guard attrs["platform"] as? String == "MAC_OS" else { continue }
+        let id = version["id"] as? String ?? ""
+        if attrs["versionString"] as? String == versionString {
             log("App Store version \(versionString) already exists")
-            return version["id"] as? String ?? ""
+            return id
+        }
+        // A freshly created app arrives with a 1.0 "Prepare for Submission"
+        // version, and another version cannot be added until that one ships.
+        if attrs["appStoreState"] as? String == "PREPARE_FOR_SUBMISSION" {
+            log("renaming the draft version to \(versionString)")
+            let patch: [String: Any] = [
+                "data": [
+                    "type": "appStoreVersions",
+                    "id": id,
+                    "attributes": ["versionString": versionString],
+                ],
+            ]
+            _ = try api("PATCH", "/v1/appStoreVersions/" + id, body: patch)
+            return id
         }
     }
     log("creating App Store version \(versionString) (MAC_OS)")
@@ -494,58 +577,38 @@ func ensureVersion(appID: String, versionString: String) throws -> String {
 
 // MARK: - Step 6: upload the package
 
-func uploadBuild(versionID: String, packageURL: URL) throws {
+func uploadBuild(packageURL: URL) throws -> String {
     let payload = try Data(contentsOf: packageURL)
-    log("uploading \(payload.count / 1024) KB to version \(versionID)")
-    let body: [String: Any] = [
-        "data": [
-            "type": "builds",
-            "attributes": [
-                "version": versionString,
-                "uploadOperations": [],
-            ],
-            "relationships": [
-                "appStoreVersion": ["data": ["type": "appStoreVersions", "id": versionID]],
-            ],
-        ],
-    ]
-    var created: [String: Any]
-    do {
-        created = apiData(try api("POST", "/v1/builds", body: body))
-    } catch let e as APIError where e.status == 404 || e.status == 405 {
-        log("POST /v1/builds unavailable (\(e.status)); using the version-scoped endpoint")
-        created = apiData(try api("POST", "/v1/appStoreVersions/" + versionID + "/build", body: body))
+    log("uploading \(payload.count / 1024) KB with altool")
+    let (status, output) = runRaw("/usr/bin/xcrun", [
+        "altool", "--upload-package", packageURL.path,
+        "--apiKey", keyID, "--apiIssuer", issuer,
+        "-t", "macos", "--output-format", "json", "--wait",
+    ])
+    // altool prints "UPLOAD SUCCEEDED" and then crashes while rendering its
+    // JSON summary on current Xcode builds, so trust the message over the exit
+    // code.
+    guard output.contains("UPLOAD SUCCEEDED") else {
+        fail("altool upload failed (exit \(status)):\n\(String(output.suffix(3000)))")
     }
-    let attrs = created["attributes"] as? [String: Any] ?? [:]
-    let operations = attrs["uploadOperations"] as? [[String: Any]] ?? []
-    guard !operations.isEmpty else { fail("no upload operations returned") }
-    for op in operations {
-        guard let urlString = op["url"] as? String,
-              let url = URL(string: urlString) else { continue }
-        let offset = (op["offset"] as? Int) ?? 0
-        let length = (op["length"] as? Int) ?? 0
-        var request = URLRequest(url: url)
-        request.httpMethod = (op["method"] as? String) ?? "PUT"
-        let headers = op["requestHeaders"] as? [[String: Any]] ?? []
-        for header in headers {
-            if let name = header["name"] as? String, let value = header["value"] as? String {
-                request.setValue(value, forHTTPHeaderField: name)
-            }
-        }
-        request.httpBody = payload.subdata(in: offset..<(offset + length))
-        let sem = DispatchSemaphore(value: 0)
-        var status = 0
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if let http = response as? HTTPURLResponse { status = http.statusCode }
-            if let error { print("upload error: \(error)") }
-            sem.signal()
-        }.resume()
-        sem.wait()
-        guard (200..<300).contains(status) else {
-            fail("upload chunk failed with status \(status)")
-        }
+    log("upload succeeded")
+    return output
+}
+
+/// Reads the delivery UUID altool reports and attaches that build to the
+/// App Store version, which the API does not do on its own.
+func attachBuild(versionID: String, altoolOutput: String) throws {
+    for line in altoolOutput.split(separator: "\n") where line.contains("Delivery UUID:") {
+        let id = line.split(separator: ":").last?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !id.isEmpty else { continue }
+        let body: [String: Any] = ["data": ["type": "builds", "id": id]]
+        _ = try api("PATCH", "/v1/appStoreVersions/" + versionID + "/relationships/build",
+                    body: body)
+        log("attached build \(id) to the version")
+        return
     }
-    log("upload finished")
+    log("no delivery UUID in the altool output; attach the build in App Store Connect")
 }
 
 // MARK: - Main
@@ -570,17 +633,22 @@ do {
     log("publishing \(appName) \(versionString) (\(bundleID))")
     let bundleResourceID = try ensureBundleId()
     let cert = try ensureDistributionCertificate()
-    _ = try ensureProfile(bundleIDResourceID: bundleResourceID,
-                          certificateID: cert.certificateID)
+    let installer = try ensureInstallerCertificate()
+    let keychain = try makeSigningKeychain(p12s: [cert.p12, installer.p12])
+    let profileName = try ensureProfile(bundleIDResourceID: bundleResourceID,
+                                        certificateIDs: [cert.certificateID])
     try installProfile(workDir.appendingPathComponent("profile.mobileprovision"))
     if dryRun {
         log("dry run: bundle id, certificate and profile are ready; stopping before build/upload")
         exit(0)
     }
-    let pkg = try buildSignedPackage(identity: cert.identity, keychain: cert.keychain)
+    let pkg = try buildSignedPackage(identity: cert.identity, keychain: keychain,
+                                     profileName: profileName,
+                                     installerIdentity: installer.identity)
     let appID = try ensureAppRecord()
     let versionID = try ensureVersion(appID: appID, versionString: versionString)
-    try uploadBuild(versionID: versionID, packageURL: pkg)
+    let altoolOutput = try uploadBuild(packageURL: pkg)
+    try attachBuild(versionID: versionID, altoolOutput: altoolOutput)
     log("published successfully")
 } catch let e as APIError {
     FileHandle.standardError.write(Data("[appstore] ERROR \(e.status): \(e.body)\n".utf8))
